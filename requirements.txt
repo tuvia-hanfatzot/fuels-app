@@ -1,2 +1,5 @@
 streamlit
 openpyxl
+base64
+copy
+io
