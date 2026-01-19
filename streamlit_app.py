@@ -4,6 +4,10 @@ from copy import copy
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import PatternFill
+from openpyxl.chart import PieChart, Reference
+from openpyxl.chart.label import DataLabelList
+from openpyxl.chart.series import DataPoint
+from openpyxl.styles import PatternFill, Font
 import base64
 
 st.set_page_config(page_title="Excel Cleaner", layout="centered")
@@ -52,6 +56,24 @@ with right:
 - Colours rows (A–G) by INTERVENTION
 """)
     st.markdown('</div>', unsafe_allow_html=True)
+
+def copy_cell_style(src, dst):
+    dst.font = copy(src.font)
+    dst.fill = copy(src.fill)
+    dst.border = copy(src.border)
+    dst.alignment = copy(src.alignment)
+    dst.number_format = src.number_format
+    dst.protection = copy(src.protection)
+
+# ----------------------------
+# Session-state cache (prevents re-processing on download click)
+# ----------------------------
+def _reset_cached_output():
+    st.session_state.pop("cleaned_bytes", None)
+    st.session_state.pop("cleaned_name", None)
+
+if "last_upload_key" not in st.session_state:
+    st.session_state.last_upload_key = None
 
 # ----------------------------
 # Excel helpers
@@ -141,10 +163,6 @@ def rgb_fill(r, g, b):
     """openpyxl uses ARGB hex, so prefix FF for fully-opaque."""
     return PatternFill(fill_type="solid", fgColor=f"FF{r:02X}{g:02X}{b:02X}")
 
-# ----------------------------
-# Processing
-# ----------------------------
-
 def show_small_loader_video(placeholder, path: str, width_px: int = 220):
     with open(path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode("utf-8")
@@ -160,7 +178,28 @@ def show_small_loader_video(placeholder, path: str, width_px: int = 220):
         unsafe_allow_html=True
     )
 
+# ----------------------------
+# Processing
+# ----------------------------
 if uploaded:
+    # If the upload changed, clear cached output so we re-process once
+    upload_key = f"{uploaded.name}:{uploaded.size}"
+    if st.session_state.last_upload_key != upload_key:
+        st.session_state.last_upload_key = upload_key
+        _reset_cached_output()
+
+    # If we've already processed this upload, don't re-run heavy code
+    if "cleaned_bytes" in st.session_state:
+        st.success("Done! Download your cleaned file below.")
+        st.download_button(
+            "Download cleaned Excel",
+            data=st.session_state.cleaned_bytes,
+            file_name=st.session_state.get("cleaned_name", "cleaned.xlsx"),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        st.stop()
+
     progress = st.progress(0)
     status = st.empty()
 
@@ -183,8 +222,6 @@ if uploaded:
                 f"Sheets found: {list(sheet_map.keys())}"
             )
         else:
-            # (optional) keep spinner text OR remove it because the dog video is the loader
-            # with st.spinner("Processing…"):
             keep_name = sheet_map[TARGET_SHEET]
             keep_name_cache = sheet_map_cache[TARGET_SHEET]
 
@@ -402,6 +439,15 @@ if uploaded:
             if intervention_col is None:
                 intervention_col = 1
 
+            # --- Normalise: fold UN-OHCHR into INGOs (so all calculations treat it as INGOs) ---
+            for r in range(2, ws.max_row + 1):
+                v = ws.cell(row=r, column=intervention_col).value
+                if v is None:
+                    continue
+                t = str(v).strip()
+                if "UN-OHCHR" in t.upper():
+                    ws.cell(row=r, column=intervention_col).value = "INGOs"
+
             rows_data = []
             for r in range(2, ws.max_row + 1):
                 fuel_val = safe_float(ws.cell(row=r, column=unified_col).value)
@@ -480,16 +526,78 @@ if uploaded:
                 target.number_format = style_src.number_format
                 target.protection = copy(style_src.protection)
             progress.progress(94)
+            
+            # =====================================================
+            # NEW: MERGE "Total Sum Per Category" (G) BY INTERVENTION
+            # Merges G for each consecutive INTERVENTION group
+            # (sorting already grouped INTERVENTION together)
+            # =====================================================
+            status.info('Merging "Total Sum Per Category" by INTERVENTION…')
+
+            INTERVENTION_COL = intervention_col
+            TOTAL_CAT_COL = total_cat_col  # should be 7 (G)
+
+            def _norm_intervention(v):
+                return "" if v is None else str(v).strip().upper()
+
+            start = 2
+            while start <= ws.max_row:
+                key = _norm_intervention(ws.cell(row=start, column=INTERVENTION_COL).value)
+
+                end = start
+                while end + 1 <= ws.max_row and _norm_intervention(ws.cell(row=end + 1, column=INTERVENTION_COL).value) == key:
+                    end += 1
+
+                # Merge only if group has 2+ rows
+                if end > start:
+                    # Take style + value from the first row in the group
+                    top_cell = ws.cell(row=start, column=TOTAL_CAT_COL)
+                    top_val = top_cell.value
+                    top_style = {
+                        "font": copy(top_cell.font),
+                        "fill": copy(top_cell.fill),
+                        "border": copy(top_cell.border),
+                        "alignment": copy(top_cell.alignment),
+                        "number_format": top_cell.number_format,
+                        "protection": copy(top_cell.protection),
+                    }
+
+                    # Merge range G(start):G(end)
+                    ws.merge_cells(start_row=start, start_column=TOTAL_CAT_COL,
+                                   end_row=end, end_column=TOTAL_CAT_COL)
+
+                    # Re-apply value + style to the merged (top-left) cell
+                    merged_top = ws.cell(row=start, column=TOTAL_CAT_COL)
+                    merged_top.value = top_val
+                    merged_top.font = copy(top_style["font"])
+                    merged_top.fill = copy(top_style["fill"])
+                    merged_top.border = copy(top_style["border"])
+                    merged_top.alignment = copy(top_style["alignment"])
+                    merged_top.number_format = top_style["number_format"]
+                    merged_top.protection = copy(top_style["protection"])
+
+                start = end + 1
+
+            # ============================
+            # 1) OPTIONAL: rename LOGISTICS -> UN Agencies
+            # Put this BEFORE the colouring loop (right before: status.info("Applying colours…"))
+            # ============================
+            for r in range(2, ws.max_row + 1):
+                v = ws.cell(row=r, column=intervention_col).value
+                if v is None:
+                    continue
+                if str(v).strip().upper() == "LOGISTICS":
+                    ws.cell(row=r, column=intervention_col).value = "UN Agencies"
 
             # ---------- COLOR A–G BASED ON INTERVENTION ----------
             status.info("Applying colours…")
             fills = {
                 "TELECOMMUNICATIONS": rgb_fill(213, 243, 251),
                 "HEALTH": rgb_fill(0, 176, 80),
-                "WASH_OR_LOGISTICS": rgb_fill(250, 178, 138),
+                "WASH": rgb_fill(250, 178, 138),
                 "INGOs": rgb_fill(190, 158, 242),
-                "UNOCHR_SUBSTR": rgb_fill(0, 176, 240),   # contains "UN-OHCHR"
                 "WFP": rgb_fill(44, 195, 236),
+                "UN_AGENCIES": rgb_fill(0, 176, 240),
             }
 
             COLOR_MIN_COL = 1  # A
@@ -501,18 +609,23 @@ if uploaded:
                 intervention_up = intervention_text.upper()
 
                 row_fill = None
-                if "UN-OHCHR" in intervention_up:
-                    row_fill = fills["UNOCHR_SUBSTR"]
+
+                # Priority: WFP
+                if intervention_up == "WFP":
+                    row_fill = fills["WFP"]
+
+                # LOGISTICS renamed to UN Agencies and uses the *old* UN-OHCHR colour
+                elif intervention_up == "UN AGENCIES":
+                    row_fill = fills["UN_AGENCIES"]
+
                 elif intervention_up == "TELECOMMUNICATIONS":
                     row_fill = fills["TELECOMMUNICATIONS"]
                 elif intervention_up == "HEALTH":
                     row_fill = fills["HEALTH"]
-                elif intervention_up == "WASH" or intervention_up == "LOGISTICS":
-                    row_fill = fills["WASH_OR_LOGISTICS"]
+                elif intervention_up == "WASH":
+                    row_fill = fills["WASH"]
                 elif intervention_up == "INGOS":
                     row_fill = fills["INGOs"]
-                elif intervention_up == "WFP":
-                    row_fill = fills["WFP"]
 
                 if row_fill is None:
                     continue
@@ -521,6 +634,185 @@ if uploaded:
                     ws.cell(row=r, column=c).fill = row_fill
 
             progress.progress(100)
+
+        # =====================================================
+        # NEW: Create summary sheet (סקטור / כמות דלק (ליטר))
+        # Uses totals per INTERVENTION (sum of Unified Fuel column F)
+        # Keeps same colours per sector
+        # =====================================================
+
+        # 1) Build totals per INTERVENTION from the final cleaned sheet
+        totals_by_intervention = {}
+        for r in range(2, ws.max_row + 1):
+            iv = ws.cell(row=r, column=intervention_col).value
+            iv_key = "" if iv is None else str(iv).strip()
+            if iv_key == "":
+                continue
+            totals_by_intervention[iv_key.upper()] = totals_by_intervention.get(iv_key.upper(), 0.0) + safe_float(
+                ws.cell(row=r, column=unified_col).value  # Unified Fuel (F)
+            )
+
+        # 2) Define the required display order + Hebrew translations
+        sector_rows = [
+            ("TELECOMMUNICATIONS", "תקשורת"),
+            ("HEALTH", "בריאות"),
+            ("WASH", "סניטציה"),
+            ("INGOS", "ארגונים לא ממשלתיים"),
+            ("UN AGENCIES", 'סוכנויות או"ם'),
+            ("WFP", "WFP"),
+        ]
+
+        # 3) Create/replace the sheet
+        SUMMARY_SHEET_NAME = "Sector Summary"
+        if SUMMARY_SHEET_NAME in wb.sheetnames:
+            wb.remove(wb[SUMMARY_SHEET_NAME])
+        ws_sum = wb.create_sheet(SUMMARY_SHEET_NAME)
+
+        # 4) Headers (Hebrew)
+        ws_sum["A1"].value = "סקטור"
+        ws_sum["B1"].value = "כמות דלק (ליטר)"
+
+        # Black background + white text
+        header_fill = PatternFill("solid", fgColor="000000")
+        header_font = Font(color="FFFFFF", bold=True)
+
+        for cell_ref in ("A1", "B1", "C1"):   # C1 exists for %
+            cell = ws_sum[cell_ref]
+            cell.fill = header_fill
+            cell.font = header_font
+
+        # Optional: copy header styling from your main sheet header row (A1 style)
+        hdr_src = ws.cell(row=1, column=1)
+        for addr in ("A1", "B1"):
+            c = ws_sum[addr]
+            c.font = copy(hdr_src.font)
+            c.fill = copy(hdr_src.fill)
+            c.border = copy(hdr_src.border)
+            c.alignment = copy(hdr_src.alignment)
+            c.number_format = hdr_src.number_format
+            c.protection = copy(hdr_src.protection)
+
+        # Column widths (nice readable)
+        ws_sum.column_dimensions["A"].width = 28
+        ws_sum.column_dimensions["B"].width = 18
+
+        # Number format for litres column (copy from Unified Fuel style if you want)
+        num_src = ws.cell(row=2, column=unified_col)  # any body cell in Unified Fuel column
+        litres_number_format = num_src.number_format
+
+        # 5) Reuse the SAME colour fills you already defined for the main sheet
+        # Make sure these keys match your current colour logic
+        summary_fills = {
+            "TELECOMMUNICATIONS": fills["TELECOMMUNICATIONS"],
+            "HEALTH": fills["HEALTH"],
+            "WASH": fills["WASH"],
+            "INGOS": fills["INGOs"],
+            "UN AGENCIES": fills.get("UN_AGENCIES", rgb_fill(0, 176, 240)),  # fallback just in case
+            "WFP": fills["WFP"],
+        }
+
+        # 6.1) Map: INTERVENTION -> first row index (used as style source)
+        style_row_by_intervention = {}
+        for r in range(2, ws.max_row + 1):
+            iv = ws.cell(row=r, column=intervention_col).value
+            k = "" if iv is None else str(iv).strip().upper()
+            if k and k not in style_row_by_intervention:
+                style_row_by_intervention[k] = r
+
+        # 6.2) Write summary rows using the main-sheet row styles
+        row_i = 2
+        for key_en, label_he in sector_rows:
+            key_u = key_en.strip().upper()
+
+            # pick a source row from the main sheet
+            src_r = style_row_by_intervention.get(key_u)
+
+            a_cell = ws_sum.cell(row=row_i, column=1)
+            b_cell = ws_sum.cell(row=row_i, column=2)
+
+            # values
+            a_cell.value = label_he
+            b_cell.value = totals_by_intervention.get(key_u, 0.0)
+
+            if src_r is not None:
+                # copy style from main sheet:
+                # - column A style from the INTERVENTION cell (text look)
+                # - column B style from Unified Fuel cell (number look)
+                src_a = ws.cell(row=src_r, column=intervention_col)
+                src_b = ws.cell(row=src_r, column=unified_col)
+
+                copy_cell_style(src_a, a_cell)
+                copy_cell_style(src_b, b_cell)
+            else:
+                # fallback (if category not found in data): at least keep header-ish formatting
+                copy_cell_style(hdr_src, a_cell)
+                copy_cell_style(hdr_src, b_cell)
+                b_cell.number_format = litres_number_format
+
+            # apply colours to A+B (same sector colour)
+            fill_obj = summary_fills.get(key_u)
+            if fill_obj:
+                a_cell.fill = fill_obj
+                b_cell.fill = fill_obj
+
+            row_i += 1
+
+        # ============================
+        # EXCEL PIE CHART (inside the workbook) + % table under it
+        # ============================
+
+        FIRST_ROW = 2
+        LAST_ROW = FIRST_ROW + len(sector_rows) - 1  # 7 if you have 6 sectors
+
+        # Helper % column in C (so we can also show % under the chart)
+        ws_sum["C1"].value = "אחוז"
+        copy_cell_style(ws_sum["A1"], ws_sum["C1"])  # header style like the other headers
+        ws_sum.column_dimensions["C"].width = 12
+
+        for r in range(FIRST_ROW, LAST_ROW + 1):
+            # =B2/SUM($B$2:$B$7)
+            ws_sum.cell(row=r, column=3).value = f"=B{r}/SUM($B${FIRST_ROW}:$B${LAST_ROW})"
+            # Copy number styling from the litres column, but format as percent
+            copy_cell_style(ws_sum.cell(row=r, column=2), ws_sum.cell(row=r, column=3))
+            ws_sum.cell(row=r, column=3).number_format = "0.0%"
+
+        # Pie chart: values from B2:B7, labels from A2:A7
+        pie = PieChart()
+        data = Reference(ws_sum, min_col=2, min_row=1, max_row=LAST_ROW)      # includes header "כמות דלק (ליטר)"
+        cats = Reference(ws_sum, min_col=1, min_row=FIRST_ROW, max_row=LAST_ROW)
+        pie.add_data(data, titles_from_data=True)
+        pie.set_categories(cats)
+
+        pie.title = ""
+        pie.dataLabels = DataLabelList()
+        pie.dataLabels.showCatName = True     # show the sector name (Hebrew text in col A)
+        pie.dataLabels.showPercent = True     # show %
+        pie.dataLabels.showVal = False        # hide 78,674
+        pie.dataLabels.showSerName = False    # hide "כמות דלק (ליטר)"
+        pie.dataLabels.showLeaderLines = True
+        pie.dataLabels.separator = "\n"       # put name and % on two lines
+        pie.legend = None                     # hide list of categories
+
+        # Match slice colours to your sector colours (hex, no '#')
+        slice_colors = [
+            "D5F3FB",  # TELECOMMUNICATIONS
+            "00B050",  # HEALTH
+            "FAB28A",  # WASH
+            "BE9EF2",  # INGOs
+            "00B0F0",  # UN Agencies
+            "2CC3EC",  # WFP
+        ]
+
+        # Apply slice colours (1 series in a pie chart)
+        ser = pie.series[0]
+        ser.dPt = []
+        for i, hx in enumerate(slice_colors[:len(sector_rows)]):
+            dp = DataPoint(idx=i)
+            dp.graphicalProperties.solidFill = hx
+            ser.dPt.append(dp)
+
+        # Position chart to the right of the table (adjust if you want)
+        ws_sum.add_chart(pie, "E2")
 
         # ---------- Save + download ----------
         output = BytesIO()
