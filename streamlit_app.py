@@ -654,6 +654,44 @@ def style_headers_black_only_with_text(ws, header_row=1):
             cell.fill = header_fill
             cell.font = header_font
 
+def _font_without_bold(f: Font) -> Font:
+    if f is None:
+        return Font(bold=False)
+    return Font(
+        name=f.name,
+        sz=f.sz,
+        b=False,
+        i=f.italic,
+        u=f.underline,
+        strike=f.strike,
+        color=f.color,
+        vertAlign=f.vertAlign,
+        outline=f.outline,
+        shadow=f.shadow,
+        condense=f.condense,
+        extend=f.extend,
+        charset=f.charset,
+        family=f.family,
+        scheme=f.scheme,
+    )
+
+
+def remove_bold_except_header(ws, header_row=1):
+    """
+    Remove bold from all cells except header row.
+    Keeps other font properties intact.
+    """
+    max_r = ws.max_row
+    max_c = ws.max_column
+    for r in range(1, max_r + 1):
+        if r == header_row:
+            continue
+        for c in range(1, max_c + 1):
+            cell = ws.cell(row=r, column=c)
+            f = cell.font
+            if f is not None and f.bold:
+                cell.font = _font_without_bold(f)
+
 def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, status=None) -> BytesIO:
     """
     Takes the combined workbook bytes (with sheet 'Master'),
@@ -911,14 +949,23 @@ def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, s
     if status:
         status.info("Sorting…")
 
+    # Find INTERVENTION + AGENCY columns
     intervention_col = None
+    agency_col = None
+
     for c in range(1, ws.max_column + 1):
         h = ws.cell(row=1, column=c).value
-        if norm_header(h) == "INTERVENTION":
+        nh = norm_header(h)
+        if nh == "INTERVENTION":
             intervention_col = c
-            break
+        elif nh == "AGENCY":
+            agency_col = c
+
     if intervention_col is None:
         intervention_col = 1
+
+    if agency_col is None:
+        raise RuntimeError('Header "AGENCY" not found.')
 
     # Normalise: fold UN-OHCHR into INGOs
     for r in range(2, ws.max_row + 1):
@@ -929,19 +976,86 @@ def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, s
         if "UN-OHCHR" in t.upper():
             ws.cell(row=r, column=intervention_col).value = "INGOs"
 
+    REGULAR_INTERVENTIONS = {
+        "TELECOMMUNICATIONS",
+        "HEALTH",
+        "WASH",
+        "INGOS",
+        "UN-OHCHR",
+        "WFP",
+        "LOGISTICS",   # IMPORTANT: exclude from prefix+convert logic
+    }
+
+    def _clean_str(v):
+        return "" if v is None else str(v).strip()
+
+    converted_desc_keys = set()  # <-- stable IDs for converted rows
     rows_data = []
-    for r in range(2, ws.max_row + 1):
+    max_r = ws.max_row  # cache for speed
+
+    for r in range(2, max_r + 1):
+        iv_raw = _clean_str(ws.cell(row=r, column=intervention_col).value)
+        iv_up = iv_raw.upper()
+
+        is_converted = False
+
+        # Apply your rule ONLY when intervention is not regular
+        if iv_raw and (iv_up not in REGULAR_INTERVENTIONS):
+            agency_cell = ws.cell(row=r, column=agency_col)
+            agency_raw = _clean_str(agency_cell.value)
+
+            prefix = f"{iv_raw} - "
+            if not agency_raw.startswith(prefix):
+                agency_cell.value = f"{iv_raw} - {agency_raw}" if agency_raw else f"{iv_raw} -"
+
+            # Convert INTERVENTION to INGOs
+            ws.cell(row=r, column=intervention_col).value = "INGOs"
+            is_converted = True
+
+        # After any conversion, read the final values used for sorting + tracking
         fuel_val = safe_float(ws.cell(row=r, column=unified_col).value)
-        intervention_val = str(ws.cell(row=r, column=intervention_col).value or "")
-        rows_data.append({"fuel": fuel_val, "intervention": intervention_val, "row": snapshot_row(ws, r)})
+        iv_after = _clean_str(ws.cell(row=r, column=intervention_col).value)
+        desc_key = ws.cell(row=r, column=desc_col).value
 
-    rows_data.sort(key=lambda x: -x["fuel"])
-    rows_data.sort(key=lambda x: x["intervention"].strip().lower())
+        # Track converted rows by stable key (survives sorting/deletions)
+        if is_converted:
+            converted_desc_keys.add(desc_key)
 
+        rows_data.append({
+            "fuel": fuel_val,
+            "intervention": iv_after,
+            "is_converted": is_converted,
+            "orig_index": r,
+            "desc_key": desc_key,
+            "row": snapshot_row(ws, r),
+        })
+
+
+    # ONE sort (tuple key) so behaviour is deterministic:
+    # 1) intervention A–Z
+    # 2) inside INGOs: real INGOs first, converted/prefixed last
+    # 3) fuel DESC only for rows that are NOT converted prefixed INGOs
+    # 4) stable fallback by orig_index
+    def _sort_key(x):
+        iv = (x["intervention"] or "").strip().lower()
+        is_ingos = (iv == "ingos")
+
+        # 0 = purple (real INGOs), 1 = white (converted/prefixed)
+        converted_rank = 1 if (is_ingos and x["is_converted"]) else 0
+
+        # Sort fuel DESC inside BOTH purple and white groups (independently)
+        fuel_rank = -x["fuel"] if is_ingos else -x["fuel"]
+
+        return (iv, converted_rank, fuel_rank, x["orig_index"])
+
+    rows_data.sort(key=_sort_key)
+
+    # Restore rows and rebuild "converted rows" positions AFTER sorting
     write_row = 2
     for obj in rows_data:
         restore_row(ws, write_row, obj["row"])
         write_row += 1
+
 
     if progress:
         progress.progress(80)
@@ -1073,6 +1187,12 @@ def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, s
     if status:
         status.info("Applying colours…")
 
+    def _is_converted_row(r: int) -> bool:
+        iv = ws.cell(row=r, column=intervention_col).value
+        if ("" if iv is None else str(iv).strip().upper()) != "INGOS":
+            return False
+        return ws.cell(row=r, column=desc_col).value in converted_desc_keys
+
     fills = {
         "TELECOMMUNICATIONS": rgb_fill(213, 243, 251),
         "HEALTH": rgb_fill(0, 176, 80),
@@ -1091,6 +1211,7 @@ def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, s
         intervention_up = intervention_text.upper()
 
         row_fill = None
+
         if intervention_up == "WFP":
             row_fill = fills["WFP"]
         elif intervention_up == "UN AGENCIES":
@@ -1102,16 +1223,20 @@ def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, s
         elif intervention_up == "WASH":
             row_fill = fills["WASH"]
         elif intervention_up == "INGOS":
-            row_fill = fills["INGOs"]
+            # Converted/prefixed rows must remain white; real INGOs must be purple
+            if _is_converted_row(r):
+                row_fill = None
+            else:
+                row_fill = fills["INGOs"]
 
+
+        # CRITICAL: never write None into .fill
         if row_fill is None:
             continue
 
         for c in range(COLOR_MIN_COL, COLOR_MAX_COL + 1):
             ws.cell(row=r, column=c).fill = row_fill
 
-    if progress:
-        progress.progress(98)
 
     # Summary sheet (Sector Summary) + pie chart
     totals_by_intervention = {}
@@ -1257,6 +1382,9 @@ def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, s
 
     if progress:
         progress.progress(100)
+
+    # Remove ALL bold on Distribution Summary except header row
+    remove_bold_except_header(ws, header_row=1)
 
     # Force header style on both sheets
     style_headers_black_only_with_text(ws, header_row=1)      # Distribution Summary
