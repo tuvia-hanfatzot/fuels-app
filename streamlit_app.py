@@ -977,7 +977,7 @@ def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, s
             ws.cell(row=r, column=intervention_col).value = "INGOs"
 
     REGULAR_INTERVENTIONS = {
-        "TELECOMMUNICATIONS",
+        "ETC",
         "HEALTH",
         "WASH",
         "INGOS",
@@ -1194,7 +1194,7 @@ def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, s
         return ws.cell(row=r, column=desc_col).value in converted_desc_keys
 
     fills = {
-        "TELECOMMUNICATIONS": rgb_fill(213, 243, 251),
+        "ETC": rgb_fill(213, 243, 251),
         "HEALTH": rgb_fill(0, 176, 80),
         "WASH": rgb_fill(250, 178, 138),
         "INGOs": rgb_fill(190, 158, 242),
@@ -1216,8 +1216,8 @@ def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, s
             row_fill = fills["WFP"]
         elif intervention_up == "UN AGENCIES":
             row_fill = fills["UN_AGENCIES"]
-        elif intervention_up == "TELECOMMUNICATIONS":
-            row_fill = fills["TELECOMMUNICATIONS"]
+        elif intervention_up == "ETC":
+            row_fill = fills["ETC"]
         elif intervention_up == "HEALTH":
             row_fill = fills["HEALTH"]
         elif intervention_up == "WASH":
@@ -1250,7 +1250,7 @@ def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, s
         )
 
     sector_rows = [
-        ("TELECOMMUNICATIONS", "תקשורת"),
+        ("ETC", "תקשורת"),
         ("HEALTH", "בריאות"),
         ("WASH", "סניטציה"),
         ("INGOS", "ארגונים לא ממשלתיים"),
@@ -1290,7 +1290,7 @@ def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, s
     litres_number_format = num_src.number_format
 
     summary_fills = {
-        "TELECOMMUNICATIONS": fills["TELECOMMUNICATIONS"],
+        "ETC": fills["ETC"],
         "HEALTH": fills["HEALTH"],
         "WASH": fills["WASH"],
         "INGOS": fills["INGOs"],
