@@ -9,11 +9,13 @@ from openpyxl.utils import get_column_letter
 from openpyxl.cell.cell import MergedCell
 from openpyxl.utils.cell import range_boundaries
 
-from openpyxl.styles import PatternFill, Font
+from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
 from openpyxl.chart import PieChart, Reference
 from openpyxl.chart.label import DataLabelList
 from openpyxl.chart.series import DataPoint
 from openpyxl.styles import PatternFill, Font
+
+from datetime import datetime, date, timedelta
 
 
 # ============================================================
@@ -1395,16 +1397,514 @@ def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, s
     out.seek(0)
     return out
 
+
 # ============================================================
-# UI: Upload multiple files → run combine → run calculations → download
+# FUEL DASHBOARD HELPERS (added from standalone Fuel Overview app)
+# ============================================================
+
+def find_cell_exact(ws, text: str):
+    target = text.strip().upper()
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            value = ws.cell(r, c).value
+            if value is None:
+                continue
+            if str(value).strip().upper() == target:
+                return r, c
+    return None, None
+
+
+def find_cell_containing(ws, text: str):
+    target = text.upper()
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            value = ws.cell(r, c).value
+            if value is not None and target in str(value).upper():
+                return r, c
+    return None, None
+
+
+def normalise_date(v):
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        # In these files, 05/11/2026 means May 11, 2026.
+        for fmt in ("%d-%b-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s, fmt).date()
+            except Exception:
+                pass
+    return None
+
+
+def get_sheet_by_normalised_name(wb, wanted_names):
+    wanted = {x.strip().upper() for x in wanted_names}
+    for name in wb.sheetnames:
+        if name.strip().upper() in wanted:
+            return wb[name]
+    return None
+
+
+def unmerge_and_fill_all(ws):
+    for mr in list(ws.merged_cells.ranges):
+        value = ws.cell(mr.min_row, mr.min_col).value
+        ws.unmerge_cells(str(mr))
+        for r in range(mr.min_row, mr.max_row + 1):
+            for c in range(mr.min_col, mr.max_col + 1):
+                ws.cell(r, c).value = value
+
+
+def write_number_or_blank(cell, value):
+    if value is None or value == 0:
+        cell.value = None
+    else:
+        cell.value = value
+        cell.number_format = "#,##0"
+
+
+def add_log(logs, message):
+    if logs is not None:
+        logs.append(message)
+
+
+def cell_ref(row, col):
+    return f"{get_column_letter(col)}{row}"
+
+
+def detect_org(filename: str) -> str:
+    name = filename.upper()
+    if "UNOPS" in name:
+        return "UNOPS"
+    if "WFP" in name:
+        return "WFP"
+    return "Unknown"
+
+
+def extract_current_fuel_from_file(uploaded_file):
+    org = detect_org(uploaded_file.name)
+    raw = BytesIO(uploaded_file.getvalue())
+    wb = load_workbook(raw, data_only=True)
+
+    if "Summary" not in wb.sheetnames:
+        raise RuntimeError(f'"{uploaded_file.name}" does not contain a Summary sheet.')
+
+    ws = wb["Summary"]
+
+    # Fill merged cells only horizontally to avoid duplicating WFP station names vertically.
+    for mr in list(ws.merged_cells.ranges):
+        value = ws.cell(mr.min_row, mr.min_col).value
+        ws.unmerge_cells(str(mr))
+        for c in range(mr.min_col, mr.max_col + 1):
+            ws.cell(mr.min_row, c).value = value
+
+    header_row, station_col = find_cell_containing(ws, "Fuel Station - Address")
+    if not header_row:
+        raise RuntimeError(f'"Fuel Station - Address" not found in "{uploaded_file.name}".')
+
+    diesel_col = None
+    petrol_col = None
+    for c in range(station_col + 1, ws.max_column + 1):
+        val = ws.cell(header_row, c).value
+        txt = "" if val is None else str(val).strip().upper()
+        if txt == "DIESEL":
+            diesel_col = c
+        elif txt == "PETROL":
+            petrol_col = c
+        if diesel_col and petrol_col:
+            break
+
+    if diesel_col is None:
+        raise RuntimeError(f'"Diesel" column not found in "{uploaded_file.name}".')
+    if petrol_col is None:
+        raise RuntimeError(f'"Petrol" column not found in "{uploaded_file.name}".')
+
+    rows = []
+    seen = set()
+    for r in range(header_row + 1, ws.max_row + 1):
+        row_text = " ".join(
+            str(ws.cell(r, c).value)
+            for c in range(1, ws.max_column + 1)
+            if ws.cell(r, c).value is not None
+        ).upper()
+
+        if "CURRENT FUEL IN STORAGE" in row_text:
+            break
+
+        station = ws.cell(r, station_col).value
+        if station is None or str(station).strip() == "":
+            continue
+
+        station_name = str(station).strip()
+        diesel = safe_float(ws.cell(r, diesel_col).value)
+        petrol = safe_float(ws.cell(r, petrol_col).value)
+        key = (org, station_name, diesel, petrol)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        rows.append({
+            "Organisation": org,
+            "Fuel Station - Address": station_name,
+            "Diesel": diesel,
+            "Petrol": petrol,
+            "Total Fuel": diesel + petrol,
+        })
+
+    return rows
+
+
+def extract_daily_fuel_entries(uploaded_file, selected_dates):
+    org = detect_org(uploaded_file.name)
+    raw = BytesIO(uploaded_file.getvalue())
+    wb = load_workbook(raw, data_only=True)
+
+    ws = get_sheet_by_normalised_name(wb, ["Comulative Fuel Entry", "Cumulative Fuel Entry"])
+    if ws is None:
+        raise RuntimeError(f'"Comulative Fuel Entry" not found in "{uploaded_file.name}".')
+
+    date_row, date_col = find_cell_containing(ws, "Date")
+    diesel_row, diesel_col = find_cell_containing(ws, "Total Diesel Received")
+    benzene_row, benzene_col = find_cell_containing(ws, "Total Benzene Received")
+
+    if not date_row:
+        raise RuntimeError(f'"Date" not found in "{uploaded_file.name}".')
+    if not diesel_row:
+        raise RuntimeError(f'"Total Diesel Received" not found in "{uploaded_file.name}".')
+    if not benzene_row:
+        raise RuntimeError(f'"Total Benzene Received" not found in "{uploaded_file.name}".')
+
+    selected_dates = set(selected_dates)
+    results = {}
+    for r in range(date_row + 1, ws.max_row + 1):
+        current_date = normalise_date(ws.cell(r, date_col).value)
+        if current_date is None or current_date not in selected_dates:
+            continue
+        diesel = safe_float(ws.cell(r, diesel_col).value)
+        benzene = safe_float(ws.cell(r, benzene_col).value)
+        results[current_date] = diesel + benzene
+
+    return org, results
+
+
+def extract_fuel_used(uploaded_file, selected_dates, logs=None):
+    org = detect_org(uploaded_file.name)
+    add_log(logs, f"========== Fuel Used | {uploaded_file.name} | detected org: {org} ==========")
+
+    raw = BytesIO(uploaded_file.getvalue())
+    wb = load_workbook(raw, data_only=True)
+    ws = get_sheet_by_normalised_name(
+        wb,
+        [
+            "Comulative Ditribution Summary",
+            "Comulative Distribution Summary",
+            "Cumulative Ditribution Summary",
+            "Cumulative Distribution Summary",
+        ],
+    )
+    if ws is None:
+        raise RuntimeError(f'"Comulative Ditribution Summary" not found in "{uploaded_file.name}".')
+
+    date_row, date_col = find_cell_exact(ws, "Date")
+    sum_row, sum_col = find_cell_exact(ws, "Sum")
+    if not date_row:
+        raise RuntimeError(f'Exact cell "Date" not found in "{uploaded_file.name}".')
+    if not sum_row:
+        raise RuntimeError(f'Exact cell "Sum" not found in "{uploaded_file.name}".')
+
+    sum_start_col = sum_col
+    sum_end_col = sum_col
+    for mr in list(ws.merged_cells.ranges):
+        if mr.min_row <= sum_row <= mr.max_row and mr.min_col <= sum_col <= mr.max_col:
+            sum_start_col = mr.min_col
+            sum_end_col = mr.max_col
+            break
+
+    add_log(logs, f"Exact Date found at {cell_ref(date_row, date_col)}")
+    add_log(logs, f"Exact Sum found at {cell_ref(sum_row, sum_col)}")
+    add_log(logs, f"Using ONLY Sum section columns: {get_column_letter(sum_start_col)}:{get_column_letter(sum_end_col)}")
+
+    unmerge_and_fill_all(ws)
+    selected_dates = set(selected_dates)
+    add_log(logs, f"Selected dates: {[d.strftime('%m/%d/%Y') for d in selected_dates]}")
+
+    total_used = 0.0
+    active_diesel_col = None
+    active_petrol_col = None
+
+    for r in range(sum_row + 1, ws.max_row + 1):
+        current_date = normalise_date(ws.cell(r, date_col).value)
+        header_pair_found = False
+
+        for c in range(sum_start_col, sum_end_col):
+            left_val = ws.cell(r, c).value
+            right_val = ws.cell(r, c + 1).value
+            left_txt = "" if left_val is None else str(left_val).strip().upper()
+            right_txt = "" if right_val is None else str(right_val).strip().upper()
+
+            if left_txt in ("DIESEL", "DIESIL") and right_txt == "PETROL":
+                active_diesel_col = c
+                active_petrol_col = c + 1
+                header_pair_found = True
+                add_log(logs, f"SUM header found row {r}: {cell_ref(r, c)}='{left_val}', {cell_ref(r, c + 1)}='{right_val}'")
+                break
+
+        if header_pair_found:
+            continue
+        if current_date not in selected_dates:
+            continue
+        if active_diesel_col is None or active_petrol_col is None:
+            add_log(logs, f"Skipped row {r}: date matched but no Diesel/Petrol header under exact Sum yet.")
+            continue
+
+        diesel_raw = ws.cell(r, active_diesel_col).value
+        petrol_raw = ws.cell(r, active_petrol_col).value
+        diesel_txt = "" if diesel_raw is None else str(diesel_raw).strip().upper()
+        petrol_txt = "" if petrol_raw is None else str(petrol_raw).strip().upper()
+        if diesel_txt in ("DIESEL", "DIESIL") or petrol_txt == "PETROL":
+            continue
+
+        diesel_num = safe_float(diesel_raw)
+        petrol_num = safe_float(petrol_raw)
+        combined = diesel_num + petrol_num
+        total_used += combined
+        add_log(logs, f"{org} SUM value row {r}, date {current_date.strftime('%m/%d/%Y')}: Diesel {cell_ref(r, active_diesel_col)}={diesel_raw} -> {diesel_num}, Petrol {cell_ref(r, active_petrol_col)}={petrol_raw} -> {petrol_num}, combined={combined}")
+
+    add_log(logs, f"FINAL USED TOTAL for {org}: {total_used}")
+    add_log(logs, "")
+    return org, total_used
+
+
+def extract_fuel_storage(uploaded_file, logs=None):
+    org = detect_org(uploaded_file.name)
+    add_log(logs, f"========== Fuel Storage | {uploaded_file.name} | detected org: {org} ==========")
+
+    raw = BytesIO(uploaded_file.getvalue())
+    wb = load_workbook(raw, data_only=True)
+    if "Summary" not in wb.sheetnames:
+        raise RuntimeError(f'"Summary" sheet not found in "{uploaded_file.name}".')
+
+    ws = wb["Summary"]
+    # Unmerge without filling so the structure stays:
+    # Current Fuel In storage (L) | empty | Diesel | Petrol
+    for mr in list(ws.merged_cells.ranges):
+        ws.unmerge_cells(str(mr))
+
+    storage_row, storage_col = find_cell_containing(ws, "Current Fuel In storage")
+    if not storage_row:
+        raise RuntimeError(f'"Current Fuel In storage (L)" not found in "{uploaded_file.name}".')
+
+    add_log(logs, f"Current Fuel In storage found at {cell_ref(storage_row, storage_col)}")
+    diesel_col = None
+    for c in range(storage_col + 1, ws.max_column + 1):
+        raw_value = ws.cell(storage_row, c).value
+        add_log(logs, f"Storage scan {cell_ref(storage_row, c)} raw='{raw_value}'")
+        if raw_value is None or str(raw_value).strip() == "":
+            continue
+        diesel_col = c
+        break
+
+    if diesel_col is None:
+        add_log(logs, f"No diesel value found for {org}. Storage total = 0")
+        return org, 0
+
+    petrol_col = diesel_col + 1
+    diesel_raw = ws.cell(storage_row, diesel_col).value
+    petrol_raw = ws.cell(storage_row, petrol_col).value if petrol_col <= ws.max_column else None
+    diesel = safe_float(diesel_raw)
+    petrol = safe_float(petrol_raw)
+
+    add_log(logs, f"Storage values for {org}: Diesel {cell_ref(storage_row, diesel_col)}={diesel_raw} -> {diesel}, Petrol {cell_ref(storage_row, petrol_col)}={petrol_raw} -> {petrol}, combined={diesel + petrol}")
+    add_log(logs, f"FINAL STORAGE TOTAL for {org}: {diesel + petrol}")
+    add_log(logs, "")
+    return org, diesel + petrol
+
+
+def add_fuel_dashboard_sheet(
+    wb,
+    latest_uploads,
+    selected_dates,
+    logs=None,
+    sheet_name="Fuel Dashboard",
+):
+    """Adds the Fuel Dashboard as a new sheet to an existing workbook."""
+    all_rows = []
+    daily_entries = {}
+    fuel_used_by_org = {}
+    fuel_storage_by_org = {}
+
+    for uploaded_file in latest_uploads:
+        current_rows = extract_current_fuel_from_file(uploaded_file)
+        all_rows.extend(current_rows)
+
+        org, org_entries = extract_daily_fuel_entries(uploaded_file, selected_dates)
+        daily_entries[org] = org_entries
+
+        org, used_total = extract_fuel_used(uploaded_file, selected_dates, logs=logs)
+        fuel_used_by_org[org] = used_total
+
+        org, storage_total = extract_fuel_storage(uploaded_file, logs=logs)
+        fuel_storage_by_org[org] = storage_total
+
+    if sheet_name in wb.sheetnames:
+        wb.remove(wb[sheet_name])
+
+    ws = wb.create_sheet(sheet_name)
+
+    header_fill = PatternFill(fill_type="solid", fgColor="000000")
+    header_font = Font(color="FFFFFF", bold=True)
+    thin = Side(style="thin", color="000000")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+
+    # SECTION 1 - Hebrew Fuel Summary Table A1:D4
+    headers3 = ["דלק במאגרים", "דלק שנוצל", "דלק שנכנס", ""]
+    header_colours = {1: "A3B18A", 2: "F4B183", 3: "A8D5C8", 4: "FFFFFF"}
+
+    for c, h in enumerate(headers3, start=1):
+        cell = ws.cell(1, c)
+        cell.value = h
+        cell.fill = PatternFill(fill_type="solid", fgColor=header_colours[c])
+        cell.font = Font(bold=True, size=14)
+        cell.border = border
+        cell.alignment = center
+
+    total_entered_wfp = sum(daily_entries.get("WFP", {}).values())
+    total_entered_unops = sum(daily_entries.get("UNOPS", {}).values())
+
+    table_rows = [
+        {
+            "org": "UNOPS",
+            "entered": total_entered_unops,
+            "used": fuel_used_by_org.get("UNOPS", 0),
+            "storage": fuel_storage_by_org.get("UNOPS", 0),
+            "org_fill": "F47C25",
+        },
+        {
+            "org": "WFP",
+            "entered": total_entered_wfp,
+            "used": fuel_used_by_org.get("WFP", 0),
+            "storage": fuel_storage_by_org.get("WFP", 0),
+            "org_fill": "00A9E0",
+        },
+        {
+            "org": 'סה"כ',
+            "entered": total_entered_unops + total_entered_wfp,
+            "used": fuel_used_by_org.get("UNOPS", 0) + fuel_used_by_org.get("WFP", 0),
+            "storage": fuel_storage_by_org.get("UNOPS", 0) + fuel_storage_by_org.get("WFP", 0),
+            "org_fill": "FFFFFF",
+        },
+    ]
+
+    for r, row in enumerate(table_rows, start=2):
+        write_number_or_blank(ws.cell(r, 1), row["storage"])
+        write_number_or_blank(ws.cell(r, 2), row["used"])
+        write_number_or_blank(ws.cell(r, 3), row["entered"])
+        org_cell = ws.cell(r, 4)
+        org_cell.value = row["org"]
+        org_cell.fill = PatternFill(fill_type="solid", fgColor=row["org_fill"])
+
+        for c in range(1, 5):
+            cell = ws.cell(r, c)
+            cell.border = border
+            cell.font = Font(bold=True, size=14)
+            cell.alignment = center
+            cell.number_format = "#,##0"
+
+    # SECTION 2 - Daily Fuel Entry A7:C...
+    daily_start_row = 7
+    daily_start_col = 1
+    for i, h in enumerate(["Date", "WFP", "UNOPS"]):
+        cell = ws.cell(daily_start_row, daily_start_col + i)
+        cell.value = h
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.border = border
+        cell.alignment = center
+
+    row_num = daily_start_row + 1
+    for d in selected_dates:
+        ws.cell(row_num, daily_start_col).value = d.strftime("%d/%m/%Y")
+        write_number_or_blank(ws.cell(row_num, daily_start_col + 1), daily_entries.get("WFP", {}).get(d, 0))
+        write_number_or_blank(ws.cell(row_num, daily_start_col + 2), daily_entries.get("UNOPS", {}).get(d, 0))
+        for c in range(daily_start_col, daily_start_col + 3):
+            cell = ws.cell(row_num, c)
+            cell.border = border
+            cell.alignment = center
+            cell.number_format = "#,##0"
+        row_num += 1
+
+    ws.cell(row_num, daily_start_col).value = "Total"
+    ws.cell(row_num, daily_start_col + 1).value = f"=SUM(B{daily_start_row + 1}:B{row_num - 1})"
+    ws.cell(row_num, daily_start_col + 2).value = f"=SUM(C{daily_start_row + 1}:C{row_num - 1})"
+    for c in range(daily_start_col, daily_start_col + 3):
+        cell = ws.cell(row_num, c)
+        cell.border = border
+        cell.font = Font(bold=True)
+        cell.alignment = center
+        cell.number_format = "#,##0"
+
+    # SECTION 3 - Fuel Station Overview E7:I...
+    station_start_row = 7
+    station_start_col = 5
+    station_headers = ["Organisation", "Fuel Station - Address", "Diesel", "Petrol", "Total Fuel"]
+    for i, h in enumerate(station_headers):
+        cell = ws.cell(station_start_row, station_start_col + i)
+        cell.value = h
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.border = border
+        cell.alignment = center
+
+    for r_idx, row in enumerate(all_rows, start=station_start_row + 1):
+        ws.cell(r_idx, station_start_col).value = row["Organisation"]
+        ws.cell(r_idx, station_start_col + 1).value = row["Fuel Station - Address"]
+        write_number_or_blank(ws.cell(r_idx, station_start_col + 2), row["Diesel"])
+        write_number_or_blank(ws.cell(r_idx, station_start_col + 3), row["Petrol"])
+        write_number_or_blank(ws.cell(r_idx, station_start_col + 4), row["Total Fuel"])
+
+        for c in range(station_start_col, station_start_col + 5):
+            cell = ws.cell(r_idx, c)
+            cell.border = border
+            cell.alignment = center
+            cell.number_format = "#,##0"
+
+    widths = {"A": 18, "B": 18, "C": 18, "D": 18, "E": 18, "F": 32, "G": 15, "H": 15, "I": 15}
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+    for r in range(1, ws.max_row + 1):
+        ws.row_dimensions[r].height = 24
+    for r in range(1, 5):
+        ws.row_dimensions[r].height = 35
+    ws.freeze_panes = "A7"
+
+    return wb
+
+# ============================================================
+# UI: Upload → combine/calculations → add Fuel Dashboard → download
 # ============================================================
 left, right = st.columns([2, 1])
 
 with left:
     st.markdown('<div class="card">', unsafe_allow_html=True)
-    uploads = st.file_uploader("Upload Total Distribution .xlsx files", type=["xlsx"], accept_multiple_files=True)
+    uploads = st.file_uploader(
+        "Upload Total Distribution .xlsx files",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        key="distribution_uploads",
+    )
+    latest_day_uploads = st.file_uploader(
+        "Upload latest-day UNOPS + WFP files for Fuel Dashboard",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        key="latest_day_uploads",
+    )
     st.markdown(
-        '<div class="small">Combines UNOPS + WFP Total Distribution sheets first (values-only), then runs the Fuels Cleaner calculations on the combined result.</div>',
+        '<div class="small">First uploader runs the original combiner/calculations. Second uploader adds the Fuel Dashboard as an extra sheet in the same output file.</div>',
         unsafe_allow_html=True,
     )
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1414,37 +1914,63 @@ with right:
     st.markdown("**Pipeline**")
     st.markdown(
         """
-1) Combine files (values-only)  
-2) Trim last text row per file  
-3) Rebuild merges A/B  
-4) Optional: delete F–I  
-5) Run Fuels Cleaner calculations  
+1) Combine Total Distribution files  
+2) Run Fuels Cleaner calculations  
+3) Create Distribution Summary  
+4) Create Sector Summary  
+5) Add Fuel Dashboard sheet from latest-day files  
 6) Download final workbook
 """
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
+st.markdown("### Fuel Dashboard week dates")
+col1, col2 = st.columns(2)
+with col1:
+    start_date = st.date_input("Week start date")
+with col2:
+    end_date = st.date_input("Week end date")
+
+selected_dates = []
+if start_date and end_date:
+    current = start_date
+    while current <= end_date:
+        selected_dates.append(current)
+        current += timedelta(days=1)
+
 
 def _reset_cached_output():
     st.session_state.pop("final_bytes", None)
     st.session_state.pop("final_name", None)
+    st.session_state.pop("debug_logs", None)
     st.session_state.pop("last_upload_key", None)
 
 
 if "last_upload_key" not in st.session_state:
     st.session_state.last_upload_key = None
 
-
 run_btn = st.button("Run combine + calculations", type="primary", disabled=not uploads)
 
+upload_key_parts = []
 if uploads:
-    upload_key = "|".join([f"{u.name}:{u.size}" for u in uploads])
-    if st.session_state.last_upload_key != upload_key:
-        st.session_state.last_upload_key = upload_key
-        _reset_cached_output()
+    upload_key_parts.extend([f"dist:{u.name}:{u.size}" for u in uploads])
+if latest_day_uploads:
+    upload_key_parts.extend([f"dash:{u.name}:{u.size}" for u in latest_day_uploads])
+if start_date and end_date:
+    upload_key_parts.append(f"dates:{start_date.isoformat()}:{end_date.isoformat()}")
+
+upload_key = "|".join(upload_key_parts)
+if upload_key and st.session_state.last_upload_key != upload_key:
+    st.session_state.last_upload_key = upload_key
+    st.session_state.pop("final_bytes", None)
+    st.session_state.pop("final_name", None)
+    st.session_state.pop("debug_logs", None)
 
 if "final_bytes" in st.session_state and st.session_state.get("final_bytes"):
     st.success("Done! Download your final file below.")
+    if st.session_state.get("debug_logs"):
+        with st.expander("Fuel Dashboard debug logs"):
+            st.text("\n".join(st.session_state.debug_logs))
     st.download_button(
         "Download final Excel",
         data=st.session_state.final_bytes,
@@ -1457,26 +1983,52 @@ if "final_bytes" in st.session_state and st.session_state.get("final_bytes"):
 if run_btn:
     progress = st.progress(0)
     status = st.empty()
-
     loader = st.empty()
     show_small_loader_video(loader, "dog_running.mp4", width_px=220)
 
     try:
-        status.info("Step 1/2: Combining files…")
-        progress.progress(5)
+        debug_logs = []
 
+        status.info("Step 1/3: Combining Total Distribution files…")
+        progress.progress(5)
         combined_bytes = build_combined_workbook_bytes(uploads, status=status)
 
+        status.info("Step 2/3: Running Fuels Cleaner calculations…")
         progress.progress(25)
-        status.info("Step 2/2: Running calculations on combined workbook…")
-
         final_bytes = run_calculations_on_combined_bytes(combined_bytes, progress=progress, status=status)
 
-        # Cache final output (prevents rerun on download click)
+        if latest_day_uploads:
+            if not selected_dates:
+                raise RuntimeError("Please select valid week start and end dates for the Fuel Dashboard.")
+
+            status.info("Step 3/3: Adding Fuel Dashboard sheet…")
+            progress.progress(95)
+
+            final_bytes.seek(0)
+            final_wb = load_workbook(final_bytes)
+            final_wb = add_fuel_dashboard_sheet(
+                final_wb,
+                latest_day_uploads,
+                selected_dates,
+                logs=debug_logs,
+                sheet_name="Fuel Dashboard",
+            )
+            out = BytesIO()
+            final_wb.save(out)
+            out.seek(0)
+            final_bytes = out
+        else:
+            status.warning("No latest-day UNOPS/WFP files uploaded, so Fuel Dashboard was not added.")
+
+        progress.progress(100)
         st.session_state.final_bytes = final_bytes.getvalue()
         st.session_state.final_name = "Fuels summary.xlsx"
+        st.session_state.debug_logs = debug_logs
 
         status.success("Done! Download your final file below.")
+        if debug_logs:
+            with st.expander("Fuel Dashboard debug logs"):
+                st.text("\n".join(debug_logs))
         st.download_button(
             "Download final Excel",
             data=st.session_state.final_bytes,
