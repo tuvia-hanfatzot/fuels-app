@@ -1567,6 +1567,14 @@ def extract_daily_fuel_entries(uploaded_file, selected_dates):
     if ws is None:
         raise RuntimeError(f'"Comulative Fuel Entry" not found in "{uploaded_file.name}".')
 
+    # Fill merged cells horizontally only, so merged headers like "Note" are readable
+    # without wrongly duplicating values down the sheet.
+    for mr in list(ws.merged_cells.ranges):
+        value = ws.cell(mr.min_row, mr.min_col).value
+        ws.unmerge_cells(str(mr))
+        for c in range(mr.min_col, mr.max_col + 1):
+            ws.cell(mr.min_row, c).value = value
+
     date_row, date_col = find_cell_containing(ws, "Date")
     diesel_row, diesel_col = find_cell_containing(ws, "Total Diesel Received")
     benzene_row, benzene_col = find_cell_containing(ws, "Total Benzene Received")
@@ -1578,18 +1586,52 @@ def extract_daily_fuel_entries(uploaded_file, selected_dates):
     if not benzene_row:
         raise RuntimeError(f'"Total Benzene Received" not found in "{uploaded_file.name}".')
 
+    # Find the Note column near the Diesel/Benzene amount columns.
+    # In the WFP file, this Note header is merged with row 2, so we scan the nearby header area.
+    note_col = None
+    if org == "WFP":
+        min_header_row = max(1, min(date_row, diesel_row, benzene_row) - 2)
+        max_header_row = min(ws.max_row, max(date_row, diesel_row, benzene_row) + 2)
+
+        # Prefer columns close to Diesel/Benzene
+        search_start_col = max(1, min(diesel_col, benzene_col) - 2)
+        search_end_col = min(ws.max_column, max(diesel_col, benzene_col) + 5)
+
+        for r in range(min_header_row, max_header_row + 1):
+            for c in range(search_start_col, search_end_col + 1):
+                val = ws.cell(r, c).value
+                txt = "" if val is None else str(val).strip().upper()
+                if txt == "NOTE":
+                    note_col = c
+                    break
+            if note_col:
+                break
+
     selected_dates = set(selected_dates)
     results = {}
+
     for r in range(date_row + 1, ws.max_row + 1):
         current_date = normalise_date(ws.cell(r, date_col).value)
         if current_date is None or current_date not in selected_dates:
             continue
+
+        # WFP-only exclusion:
+        # If Note says "From UNOPS", ignore this row completely.
+        if org == "WFP" and note_col is not None:
+            note_value = ws.cell(r, note_col).value
+            note_text = "" if note_value is None else str(note_value).strip().upper()
+
+            if "FROM UNOPS" in note_text:
+                continue
+
         diesel = safe_float(ws.cell(r, diesel_col).value)
         benzene = safe_float(ws.cell(r, benzene_col).value)
-        results[current_date] = diesel + benzene
+
+        # Add to existing date total instead of replacing it,
+        # in case the same date appears more than once.
+        results[current_date] = results.get(current_date, 0.0) + diesel + benzene
 
     return org, results
-
 
 def extract_fuel_used(uploaded_file, selected_dates, logs=None):
     org = detect_org(uploaded_file.name)
