@@ -3,6 +3,10 @@ from io import BytesIO
 from copy import copy
 import re
 import base64
+import os
+from difflib import SequenceMatcher, get_close_matches
+
+import pandas as pd
 
 from openpyxl import load_workbook, Workbook
 from openpyxl.utils import get_column_letter
@@ -1927,12 +1931,1153 @@ def add_fuel_dashboard_sheet(
     return wb
 
 # ============================================================
+# Settings
+# ============================================================
+STATUS_COL_NAME = "סטטוס"
+DISTRIBUTION_SHEET_NAME = "Distribution Summary"
+FUZZY_THRESHOLD = 0.78
+
+APPROVAL_SHEETS = {
+    "UNOPS": ["UNOPS Total Distribution", "UNOPS Total Distribution "],
+    "WFP": ["WFP Total Distribution"],
+}
+
+# The original cleaner may prefix local/non-standard agencies like:
+#   NNGOs - Culture and Free Thought Association (CFTA)
+# while the approved list stores:
+#   Culture and Free Thought Association (CFTA)
+# More prefixes are added dynamically from the approval workbook clusters/interventions.
+BASE_GENERATED_PREFIXES = {
+    "NNGOS",
+    "NNGO",
+    "FINANCIAL INSTITUTIONS",
+    "FINANCIAL INSTITUTION",
+    "UN-OHCHR",
+    "UN OHCHR",
+    "UN - SISTERS LOGISTICS",
+    "UN SISTERS LOGISTICS",
+    "PROTECTION",
+    "SHELTER",
+    "EDUCATION",
+    "NUTRITION",
+    "LOGISTICS",
+    "FOOD SECURITY",
+    "LOCAL AUTHORITIES",
+    "CCCM",
+}
+
+STATUS_FILL_RULES = [
+    ("מסורב", "F4B084"),
+    ("מוקפא", "B4C6E7"),
+    ("מאפיות", "FFE699"),
+    ("מאושר", "C6E0B4"),
+    ("שותפים", "E2F0D9"),
+    ("בריאות", "C6E0B4"),
+    ("תקשורת", "DDEBF7"),
+    ("סניטציה", "FCE4D6"),
+    ("סוכנויות", "D9EAD3"),
+    ("NOT FOUND", "D9D9D9"),
+    ("UNKNOWN", "D9D9D9"),
+]
+
+
+# ============================================================
+# Normalisation + matching helpers
+# ============================================================
+def _norm_prefix(value) -> str:
+    if value is None:
+        return ""
+    s = str(value).strip().upper()
+    s = s.replace("’", "'").replace("`", "'")
+    s = s.replace("‐", "-").replace("‑", "-").replace("–", "-").replace("—", "-")
+    s = re.sub(r"[^A-Z0-9א-ת]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def strip_generated_prefix(value, prefixes=None) -> str:
+    """Remove prefixes added by the cleaner, for example 'NNGOs - ...'."""
+    if value is None:
+        return ""
+
+    s = str(value).strip()
+    if not s:
+        return ""
+
+    prefixes = prefixes or BASE_GENERATED_PREFIXES
+    norm_prefixes = sorted({_norm_prefix(p) for p in prefixes if p}, key=len, reverse=True)
+
+    changed = True
+    while changed:
+        changed = False
+        s_norm = _norm_prefix(s)
+
+        for prefix in norm_prefixes:
+            if not prefix:
+                continue
+
+            # Prefix may contain punctuation in the original text, so compare a normalised left side.
+            # We only remove when the actual text has a dash/colon separator after the prefix area.
+            parts = re.split(r"\s*[-–—:]\s*", s, maxsplit=1)
+            if len(parts) == 2 and _norm_prefix(parts[0]) == prefix:
+                s = parts[1].strip()
+                changed = True
+                break
+
+            # Handles cases like 'UN - Sisters Logistics - UN - Sisters Agencies'.
+            # Try removing a normalised prefix from the beginning when the next visible char is a separator.
+            pattern = re.compile(r"^\s*" + re.escape(str(prefix)) + r"\s*[-–—:]\s*", re.IGNORECASE)
+            new_s = pattern.sub("", s).strip()
+            if new_s != s:
+                s = new_s
+                changed = True
+                break
+
+    return s
+
+
+def norm_text(value, prefixes=None) -> str:
+    """Normalise names while ignoring cleaner-added category prefixes."""
+    if value is None:
+        return ""
+
+    s = strip_generated_prefix(value, prefixes=prefixes).upper()
+    s = s.replace("’", "'").replace("`", "'")
+    s = s.replace("‐", "-").replace("‑", "-").replace("–", "-").replace("—", "-")
+    s = s.replace("&", " AND ")
+
+    # Usually acronyms in brackets differ between files; remove them to match the full name.
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = re.sub(r"[^A-Z0-9א-ת]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    replacements = {
+        "INTL": "INTERNATIONAL",
+        "INT": "INTERNATIONAL",
+        "ORG": "ORGANIZATION",
+        "ASSOC": "ASSOCIATION",
+        "PROGRAMME": "PROGRAM",
+        "SOCAITY": "SOCIETY",
+        "CLOBAL": "GLOBAL",
+        "PH": "PROJECT HOPE",
+        "ACF": "ACTION AGAINST HUNGER",
+        "SI": "SOLIDARITES INTERNATIONALE",
+        "GC": "GLOBAL COMMUNITIES",
+        "MG": "MED GLOBAL",
+        "PIB": "PALESTINE ISLAMIC BANK",
+    }
+    words = [replacements.get(w, w) for w in s.split()]
+    return " ".join(words)
+
+
+def compact_key(*parts, prefixes=None) -> str:
+    return " | ".join(norm_text(p, prefixes=prefixes) for p in parts if norm_text(p, prefixes=prefixes))
+
+
+def clean_header(value) -> str:
+    return norm_text(value).replace(" ", "")
+
+
+def best_fuzzy_match(query_key: str, choices: list[str]):
+    if not query_key or not choices:
+        return None, 0.0
+
+    shortlist = get_close_matches(query_key, choices, n=8, cutoff=0.55)
+    if not shortlist:
+        shortlist = choices
+
+    best_key = None
+    best_score = 0.0
+    for choice in shortlist:
+        score = SequenceMatcher(None, query_key, choice).ratio()
+        if score > best_score:
+            best_score = score
+            best_key = choice
+
+    if best_score >= FUZZY_THRESHOLD:
+        return best_key, best_score
+    return None, best_score
+
+
+# ============================================================
+# Workbook helpers
+# ============================================================
+def get_sheet_by_names(wb, possible_names):
+    name_map = {name.strip().upper(): name for name in wb.sheetnames}
+    for wanted in possible_names:
+        real = name_map.get(wanted.strip().upper())
+        if real:
+            return wb[real]
+    return None
+
+
+def find_header_row_and_columns(ws, wanted_headers, max_scan_rows=20):
+    wanted_clean = {canonical: [clean_header(x) for x in aliases] for canonical, aliases in wanted_headers.items()}
+
+    for r in range(1, min(ws.max_row, max_scan_rows) + 1):
+        row_map = {}
+        for c in range(1, ws.max_column + 1):
+            cell_clean = clean_header(ws.cell(r, c).value)
+            if not cell_clean:
+                continue
+            for canonical, aliases in wanted_clean.items():
+                if cell_clean in aliases:
+                    row_map[canonical] = c
+
+        required = [k for k in wanted_headers if k != "Status"]
+        if all(k in row_map for k in required):
+            return r, row_map
+
+    return None, {}
+
+
+def copy_cell_style(src, dst):
+    if src is None or dst is None:
+        return
+    dst.font = copy(src.font)
+    dst.fill = copy(src.fill)
+    dst.border = copy(src.border)
+    dst.alignment = copy(src.alignment)
+    dst.number_format = src.number_format
+    dst.protection = copy(src.protection)
+
+
+def safe_float(value):
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        s = value.strip().replace(",", "")
+        if not s:
+            return 0.0
+        try:
+            return float(s)
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def status_fill(status):
+    txt = "" if status is None else str(status).strip().upper()
+    for needle, colour in STATUS_FILL_RULES:
+        if needle.upper() in txt:
+            return PatternFill(fill_type="solid", fgColor=colour)
+    return PatternFill(fill_type="solid", fgColor="D9D9D9")
+
+
+def _shift_merge_range_for_insert(range_string: str, insert_col: int) -> str:
+    """Return the same merge range after a column insertion, preserving existing merges."""
+    min_col, min_row, max_col, max_row = range_boundaries(range_string)
+
+    # If the full merged range is to the right of the inserted column, move it right.
+    if min_col >= insert_col:
+        min_col += 1
+        max_col += 1
+    # If a merged range crosses the insertion point, expand it by one column.
+    elif min_col < insert_col <= max_col:
+        max_col += 1
+
+    return (
+        f"{get_column_letter(min_col)}{min_row}:"
+        f"{get_column_letter(max_col)}{max_row}"
+    )
+
+
+def _insert_column_preserve_merges(ws, insert_col: int):
+    """openpyxl does not reliably shift merged ranges on insert_cols; do it manually."""
+    merge_ranges = [str(mr) for mr in ws.merged_cells.ranges]
+    for rng in merge_ranges:
+        ws.unmerge_cells(rng)
+
+    ws.insert_cols(insert_col, 1)
+
+    for rng in merge_ranges:
+        shifted = _shift_merge_range_for_insert(rng, insert_col)
+        try:
+            ws.merge_cells(shifted)
+        except Exception:
+            # If a corrupted/overlapping merge exists in an input file, skip only that merge.
+            pass
+
+
+def _last_text_header_col(ws, header_row, exclude_status=True):
+    """Return the last header column that contains visible text.
+
+    This is intentionally based on the header row, not ws.max_column, because
+    generated Fuels Summary workbooks can contain charts/empty formatted columns
+    to the right.
+    """
+    last_col = 1
+    for c in range(1, ws.max_column + 1):
+        value = ws.cell(header_row, c).value
+        if value is None or str(value).strip() == "":
+            continue
+        if exclude_status and str(value).strip() == STATUS_COL_NAME:
+            continue
+        last_col = max(last_col, c)
+    return last_col
+
+
+def get_or_insert_status_column(ws, header_row, description_col=None):
+    """Add סטטוס AFTER the last real header column.
+
+    Earlier versions inserted סטטוס next to DESCRIPTION. In this workbook that
+    shifts the Unified Fuel / Total Sum Per Category area and can make Unified
+    Fuel appear merged by cluster. Appending סטטוס after the last text header
+    keeps all calculation columns exactly where they are.
+    """
+    existing_status_cols = [
+        c for c in range(1, ws.max_column + 1)
+        if str(ws.cell(header_row, c).value).strip() == STATUS_COL_NAME
+    ]
+
+    last_text_col = _last_text_header_col(ws, header_row, exclude_status=True)
+    desired_status_col = last_text_col + 1
+
+    # If the workbook was already created with this fixed version, reuse the column.
+    for c in existing_status_cols:
+        if c == desired_status_col or c > last_text_col:
+            return c, False
+
+    # If a previous/bad version inserted סטטוס inside the calculation columns, stop
+    # rather than producing a misleading dashboard from already-shifted/merged data.
+    if existing_status_cols:
+        raise RuntimeError(
+            "This workbook already contains a סטטוס column inside the calculation area. "
+            "Please upload the original Fuels Summary workbook and rerun this fixed version."
+        )
+
+    status_col = desired_status_col
+    _insert_column_preserve_merges(ws, status_col)
+
+    status_header = ws.cell(header_row, status_col)
+    status_header.value = STATUS_COL_NAME
+    style_source_col = description_col if description_col else last_text_col
+    copy_cell_style(ws.cell(header_row, style_source_col), status_header)
+    status_header.alignment = Alignment(horizontal="center", vertical="center")
+    ws.column_dimensions[get_column_letter(status_col)].width = 22
+    return status_col, True
+
+
+# ============================================================
+# Approval index
+# ============================================================
+def read_approval_rows(approval_file):
+    raw = BytesIO(approval_file.getvalue())
+    wb = load_workbook(raw, data_only=True)
+
+    rows = []
+    prefixes = set(BASE_GENERATED_PREFIXES)
+
+    # ---------- UNOPS approval sheet ----------
+    ws_unops = get_sheet_by_names(wb, APPROVAL_SHEETS["UNOPS"])
+    if ws_unops is not None:
+        headers = {
+            "Cluster": ["Cluster"],
+            "Agency": ["AGENCY", "Agency"],
+            "Description": ["DESCRIPTION", "Description"],
+            "Status": [STATUS_COL_NAME, "Status"],
+        }
+        header_row, cols = find_header_row_and_columns(ws_unops, headers)
+        if header_row:
+            for r in range(header_row + 1, ws_unops.max_row + 1):
+                cluster = ws_unops.cell(r, cols.get("Cluster", 0)).value if cols.get("Cluster") else None
+                agency = ws_unops.cell(r, cols.get("Agency", 0)).value if cols.get("Agency") else None
+                desc = ws_unops.cell(r, cols.get("Description", 0)).value if cols.get("Description") else None
+                status = ws_unops.cell(r, cols.get("Status", 0)).value if cols.get("Status") else None
+                if not any([cluster, agency, desc, status]):
+                    continue
+
+                prefixes.add(str(cluster).strip())
+                rows.append({
+                    "Source Org": "UNOPS",
+                    "Approved Cluster/Intervention": cluster,
+                    "Approved Agency": agency,
+                    "Approved Description": desc,
+                    "Review Status": status or "Unknown",
+                    "Approval Sheet Row": r,
+                })
+
+    # ---------- WFP approval sheet ----------
+    ws_wfp = get_sheet_by_names(wb, APPROVAL_SHEETS["WFP"])
+    if ws_wfp is not None:
+        headers = {
+            "Intervention": ["INTERVENTION", "Intervention"],
+            "Description": ["DESCRIPTION", "Description"],
+            "Status": [STATUS_COL_NAME, "Status"],
+        }
+        header_row, cols = find_header_row_and_columns(ws_wfp, headers)
+        if header_row:
+            for r in range(header_row + 1, ws_wfp.max_row + 1):
+                intervention = ws_wfp.cell(r, cols.get("Intervention", 0)).value if cols.get("Intervention") else None
+                desc = ws_wfp.cell(r, cols.get("Description", 0)).value if cols.get("Description") else None
+                status = ws_wfp.cell(r, cols.get("Status", 0)).value if cols.get("Status") else None
+                if not any([intervention, desc, status]):
+                    continue
+
+                prefixes.add(str(intervention).strip())
+                rows.append({
+                    "Source Org": "WFP",
+                    "Approved Cluster/Intervention": intervention,
+                    "Approved Agency": None,
+                    "Approved Description": desc,
+                    "Review Status": status or "Unknown",
+                    "Approval Sheet Row": r,
+                })
+
+    if not rows:
+        raise RuntimeError("No approval rows were found in the approval workbook.")
+
+    return rows, prefixes
+
+
+def build_approval_index(approval_file):
+    approval_rows, prefixes = read_approval_rows(approval_file)
+
+    index = {
+        "UNOPS": {"exact": {}, "choices": []},
+        "WFP": {"exact": {}, "choices": []},
+    }
+
+    for row in approval_rows:
+        org = row["Source Org"]
+        cluster = row["Approved Cluster/Intervention"]
+        agency = row["Approved Agency"]
+        desc = row["Approved Description"]
+
+        if org == "UNOPS":
+            keys = {
+                compact_key(agency, desc, prefixes=prefixes),
+                compact_key(agency, prefixes=prefixes),
+                compact_key(desc, prefixes=prefixes),
+                compact_key(cluster, agency, prefixes=prefixes),
+                compact_key(cluster, agency, desc, prefixes=prefixes),
+            }
+        else:
+            keys = {
+                compact_key(cluster, desc, prefixes=prefixes),
+                compact_key(desc, prefixes=prefixes),
+                compact_key(cluster, prefixes=prefixes),
+            }
+
+        for key in keys:
+            if key:
+                index[org]["exact"].setdefault(key, row)
+
+    for org in ("UNOPS", "WFP"):
+        index[org]["choices"] = list(index[org]["exact"].keys())
+
+    return index, prefixes, pd.DataFrame(approval_rows)
+
+
+# ============================================================
+# Distribution Summary comparison
+# ============================================================
+def detect_row_source_org(cluster_value) -> str:
+    # In the final Fuels Summary workbook, WFP rows have Cluster = WFP.
+    return "WFP" if norm_text(cluster_value) == "WFP" else "UNOPS"
+
+
+def review_summary_row(cluster, agency, desc, approval_index, prefixes):
+    # Final Fuels Summary can contain internal WFP operational rows under
+    # Cluster = UN Agencies, Agency = WFP. These are not WFP partner/routine rows;
+    # they should be reviewed as approved UN agency fuel.
+    if norm_text(cluster) == "UN AGENCIES" and norm_text(agency) == "WFP":
+        return {
+            "Detected Org": "UNOPS",
+            "Review Status": 'סוכנויות או"ם מאושרות',
+            "Match Type": "Rule",
+            "Match Score": 1.0,
+            "Matched Cluster/Intervention": cluster,
+            "Matched Agency": agency,
+            "Matched Description": desc,
+            "Approval Sheet Row": None,
+        }
+
+    org = detect_row_source_org(cluster)
+    exact = approval_index[org]["exact"]
+    choices = approval_index[org]["choices"]
+
+    cleaned_agency = strip_generated_prefix(agency, prefixes=prefixes)
+
+    if org == "WFP":
+        candidate_keys = [
+            compact_key(agency, desc, prefixes=prefixes),
+            compact_key(cleaned_agency, desc, prefixes=prefixes),
+            compact_key(desc, prefixes=prefixes),
+            compact_key(cleaned_agency, prefixes=prefixes),
+        ]
+    else:
+        candidate_keys = [
+            compact_key(agency, desc, prefixes=prefixes),
+            compact_key(cleaned_agency, desc, prefixes=prefixes),
+            compact_key(cleaned_agency, prefixes=prefixes),
+            compact_key(desc, prefixes=prefixes),
+            compact_key(cluster, cleaned_agency, prefixes=prefixes),
+            compact_key(cluster, cleaned_agency, desc, prefixes=prefixes),
+        ]
+
+    for key in candidate_keys:
+        if key and key in exact:
+            match = exact[key]
+            return {
+                "Detected Org": org,
+                "Review Status": match["Review Status"],
+                "Match Type": "Exact",
+                "Match Score": 1.0,
+                "Matched Cluster/Intervention": match["Approved Cluster/Intervention"],
+                "Matched Agency": match["Approved Agency"],
+                "Matched Description": match["Approved Description"],
+                "Approval Sheet Row": match["Approval Sheet Row"],
+            }
+
+    # Fuzzy match using all candidate keys. This handles small typos and non-exact formats.
+    best_key = None
+    best_score = 0.0
+    for query_key in candidate_keys:
+        fuzzy_key, score = best_fuzzy_match(query_key, choices)
+        if score > best_score:
+            best_score = score
+            best_key = fuzzy_key
+
+    if best_key:
+        match = exact[best_key]
+        return {
+            "Detected Org": org,
+            "Review Status": match["Review Status"],
+            "Match Type": "Fuzzy",
+            "Match Score": round(best_score, 3),
+            "Matched Cluster/Intervention": match["Approved Cluster/Intervention"],
+            "Matched Agency": match["Approved Agency"],
+            "Matched Description": match["Approved Description"],
+            "Approval Sheet Row": match["Approval Sheet Row"],
+        }
+
+    return {
+        "Detected Org": org,
+        "Review Status": "Not Found",
+        "Match Type": "No Match",
+        "Match Score": round(best_score, 3),
+        "Matched Cluster/Intervention": None,
+        "Matched Agency": None,
+        "Matched Description": None,
+        "Approval Sheet Row": None,
+    }
+
+
+
+
+# ============================================================
+# Final workbook formatting helpers
+# ============================================================
+def _has_hebrew(value) -> bool:
+    if value is None:
+        return False
+    return any("\u0590" <= ch <= "\u05FF" for ch in str(value))
+
+
+def _is_number_like(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    txt = str(value).strip().replace(",", "").replace("%", "")
+    if txt == "":
+        return False
+    try:
+        float(txt)
+        return True
+    except Exception:
+        return False
+
+
+def _font_with(cell, name=None, size=None, color=None, bold=None, italic=None):
+    f = cell.font or Font()
+    return Font(
+        name=name if name is not None else f.name,
+        sz=size if size is not None else f.sz,
+        b=bold if bold is not None else f.bold,
+        i=italic if italic is not None else f.italic,
+        u=f.underline,
+        strike=f.strike,
+        color=color if color is not None else f.color,
+        vertAlign=f.vertAlign,
+        outline=f.outline,
+        shadow=f.shadow,
+        condense=f.condense,
+        extend=f.extend,
+        charset=f.charset,
+        family=f.family,
+        scheme=f.scheme,
+    )
+
+
+def _thin_black_border():
+    side = Side(style="thin", color="000000")
+    return Border(left=side, right=side, top=side, bottom=side)
+
+
+def _safe_unmerge_intersecting_columns(ws, cols_to_delete):
+    cols = set(cols_to_delete)
+    for mr in list(ws.merged_cells.ranges):
+        if any(mr.min_col <= c <= mr.max_col for c in cols):
+            ws.unmerge_cells(str(mr))
+
+
+def _delete_columns_by_headers(ws, header_row, header_names):
+    """Delete columns whose header text exactly matches any value in header_names."""
+    names = {str(x).strip().upper() for x in header_names}
+    cols = []
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(header_row, c).value
+        if v is not None and str(v).strip().upper() in names:
+            cols.append(c)
+    if not cols:
+        return
+    _safe_unmerge_intersecting_columns(ws, cols)
+    for c in sorted(cols, reverse=True):
+        ws.delete_cols(c, 1)
+
+
+def _last_nonempty_header_col(ws, header_row=1):
+    last = 1
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(header_row, c).value
+        if v is not None and str(v).strip() != "":
+            last = c
+    return last
+
+
+def _set_autofilter_to_real_headers(ws, header_row=1):
+    last = _last_nonempty_header_col(ws, header_row)
+    if last >= 1 and ws.max_row >= header_row:
+        ws.auto_filter.ref = f"A{header_row}:{get_column_letter(last)}{ws.max_row}"
+    else:
+        ws.auto_filter.ref = None
+
+
+def style_distribution_summary_final(ws):
+    """Final requested styling for Distribution Summary."""
+    border = _thin_black_border()
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.alignment = center
+            cell.border = border
+            font_color = "FFFFFF" if cell.row == 1 else "000000"
+            cell.font = _font_with(cell, name="Calibri", size=11, color=font_color, italic=False)
+    _set_autofilter_to_real_headers(ws, header_row=1)
+
+
+def style_sector_summary_final(ws):
+    """Final requested styling for Sector Summary."""
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is None:
+                continue
+            cell.alignment = center
+            # Apply Aduma to Hebrew words and numbers. This covers the Hebrew labels and values.
+            if _has_hebrew(cell.value) or _is_number_like(cell.value) or (isinstance(cell.value, str) and cell.value.startswith("=")):
+                cell.font = _font_with(cell, name="Aduma", size=20, color="000000")
+            else:
+                cell.font = _font_with(cell, size=20, color="000000")
+
+    # Make סוכנויות או"ם row text/value white.
+    for r in range(1, ws.max_row + 1):
+        val = ws.cell(r, 1).value
+        if val is not None and str(val).strip() == 'סוכנויות או"ם':
+            for c in range(1, min(ws.max_column, 3) + 1):
+                ws.cell(r, c).font = _font_with(ws.cell(r, c), color="FFFFFF")
+
+
+def style_fuel_dashboard_final(ws):
+    """Final requested styling for Fuel Dashboard."""
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    # Top table A1:D4 -> Aduma 16 for Hebrew/numbers.
+    for r in range(1, min(ws.max_row, 4) + 1):
+        for c in range(1, min(ws.max_column, 4) + 1):
+            cell = ws.cell(r, c)
+            cell.alignment = center
+            if _has_hebrew(cell.value) or _is_number_like(cell.value):
+                cell.font = _font_with(cell, name="Aduma", size=16)
+            else:
+                cell.font = _font_with(cell, size=16)
+
+    # Bottom tables from row 7 down -> size 12, Aduma for Hebrew/numbers.
+    for r in range(7, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(r, c)
+            cell.alignment = center
+            if _has_hebrew(cell.value) or _is_number_like(cell.value):
+                cell.font = _font_with(cell, name="Aduma", size=12)
+            elif cell.value is not None:
+                cell.font = _font_with(cell, size=12)
+
+
+def style_status_dashboard_final(ws):
+    """Final requested styling for סטטוס לפי אישורים."""
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.alignment = center
+            if _has_hebrew(cell.value) or _is_number_like(cell.value):
+                cell.font = _font_with(cell, name="Aduma", size=12)
+            elif cell.value is not None:
+                cell.font = _font_with(cell, size=12)
+
+
+def move_sheet_before(wb, sheet_name, before_sheet_name):
+    if sheet_name not in wb.sheetnames or before_sheet_name not in wb.sheetnames:
+        return
+    sheet = wb[sheet_name]
+    wb._sheets.remove(sheet)
+    before_idx = wb.sheetnames.index(before_sheet_name)
+    wb._sheets.insert(before_idx, sheet)
+
+
+def apply_final_workbook_layout(wb):
+    if "Distribution Summary" in wb.sheetnames:
+        style_distribution_summary_final(wb["Distribution Summary"])
+    if "Sector Summary" in wb.sheetnames:
+        style_sector_summary_final(wb["Sector Summary"])
+    if "Fuel Dashboard" in wb.sheetnames:
+        style_fuel_dashboard_final(wb["Fuel Dashboard"])
+        move_sheet_before(wb, "Fuel Dashboard", "Sector Summary")
+    if "סטטוס לפי אישורים" in wb.sheetnames:
+        style_status_dashboard_final(wb["סטטוס לפי אישורים"])
+
+# ============================================================
+# Status Dashboard sheet
+# ============================================================
+def _text_contains(value, *needles) -> bool:
+    txt = "" if value is None else str(value).strip().upper()
+    return any(str(n).strip().upper() in txt for n in needles if n)
+
+
+def _normalised_cluster(value) -> str:
+    return "" if value is None else str(value).strip().upper()
+
+
+def _find_required_dashboard_cols(ws, header_row=1):
+    cols = {}
+    for c in range(1, ws.max_column + 1):
+        h = ws.cell(header_row, c).value
+        if h is None:
+            continue
+        h_txt = str(h).strip().upper()
+        if h_txt == "CLUSTER":
+            cols["Cluster"] = c
+        elif h_txt == "AGENCY":
+            cols["Agency"] = c
+        elif h_txt == "DESCRIPTION":
+            cols["Description"] = c
+        elif h_txt == STATUS_COL_NAME:
+            cols["Status"] = c
+        elif h_txt == "UNIFIED FUEL":
+            cols["Unified Fuel"] = c
+    missing = [k for k in ["Cluster", "Status", "Unified Fuel"] if k not in cols]
+    if missing:
+        raise RuntimeError(f"Cannot build dashboard. Missing columns: {', '.join(missing)}")
+    return cols
+
+
+def _unified_fuel_column_has_bad_merges(ws, fuel_col, header_row=1):
+    """Detect the old bug where Unified Fuel was merged by cluster after inserting סטטוס."""
+    bad = []
+    for mr in ws.merged_cells.ranges:
+        if mr.min_col <= fuel_col <= mr.max_col and mr.max_row > header_row:
+            bad.append(str(mr))
+    return bad
+
+
+def _dashboard_category(cluster, agency, status):
+    """Map each reviewed row into the requested Hebrew dashboard buckets."""
+    c = _normalised_cluster(cluster)
+    a = norm_text(agency)
+    s = "" if status is None else str(status).strip()
+    su = s.upper()
+
+    # Special rule: WFP operational rows under UN Agencies are approved UN agency fuel,
+    # not WFP routine/partner fuel and not unknown entities.
+    if c == "UN AGENCIES" and a == "WFP":
+        return "un_approved"
+
+    # Dedicated sector/status buckets first.
+    if "תקשורת" in s:
+        return "communications"
+    if "בריאות" in s:
+        return "health"
+    if "סניטציה" in s:
+        return "wash_unassigned"
+    if "מאפיות" in s:
+        return "wfp_bakeries"
+
+    # WFP-specific grouping.
+    if c == "WFP":
+        if "פעילות" in s:
+            return "wfp_routine"
+        if "שותפים" in s or "ארגון" in s:
+            return "wfp_partners"
+
+    # UN buckets.
+    if "סוכנויות" in s and ("לא מפורט" in s or "לא מוכר" in s or "UN SISTERS" in su):
+        return "un_unrecognized"
+    if "סוכנויות" in s and "מאושרות" in s:
+        return "un_approved"
+
+    # Unknown/non-listed organisations.
+    if "לא מוכרים" in s or "לא מוכרות" in s or "חברות מקומיות" in s or "NOT FOUND" in su:
+        return "unknown_entities"
+
+    # NGO approval review buckets. If a status contains both מסורב and מוקפא
+    # (for example TDH), count it as מסורב.
+    if "מסורב" in s:
+        return "ngo_disapproved"
+    if "מוקפא" in s:
+        return "ngo_frozen"
+    if "מאושר" in s:
+        return "ngo_approved"
+
+    return "unknown_entities"
+
+
+def _write_dashboard_row(ws, row, sector, detail, amount, total, fill_hex, font_hex="FFFFFF", merge_detail=False):
+    thin = Side(style="thin", color="000000")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    fill = PatternFill(fill_type="solid", fgColor=fill_hex)
+
+    if merge_detail:
+        ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
+        c = ws.cell(row, 1)
+        c.value = detail
+        for col in (1, 2):
+            cell = ws.cell(row, col)
+            cell.fill = fill
+            cell.font = Font(color=font_hex, bold=True, size=12)
+            cell.alignment = center
+            cell.border = border
+    else:
+        ws.cell(row, 1).value = sector
+        ws.cell(row, 2).value = detail
+        for col in (1, 2):
+            cell = ws.cell(row, col)
+            cell.fill = fill
+            cell.font = Font(color=font_hex, bold=True, size=12)
+            cell.alignment = center
+            cell.border = border
+
+    qty_cell = ws.cell(row, 3)
+    pct_cell = ws.cell(row, 4)
+    qty_cell.value = amount if amount else None
+    pct_cell.value = (amount / total) if total else None
+
+    for cell in (qty_cell, pct_cell):
+        cell.fill = fill if cell.column == 3 else PatternFill(fill_type="solid", fgColor="D9D9D9")
+        cell.font = Font(color=(font_hex if cell.column == 3 else "000000"), bold=True, size=12)
+        cell.alignment = center
+        cell.border = border
+    qty_cell.number_format = "#,##0"
+    pct_cell.number_format = "0.0%"
+
+
+def add_status_dashboard_sheet(wb, source_ws, header_row=1, sheet_name="סטטוס לפי אישורים"):
+    """
+    Create the requested summary sheet using row-level Unified Fuel values.
+    The function intentionally sums Unified Fuel per reviewed row, NOT Total Sum Per Category.
+    """
+    cols = _find_required_dashboard_cols(source_ws, header_row=header_row)
+    fuel_col = cols["Unified Fuel"]
+    bad_merges = _unified_fuel_column_has_bad_merges(source_ws, fuel_col, header_row=header_row)
+    if bad_merges:
+        raise RuntimeError(
+            "Unified Fuel is merged in the reviewed file, so row-level dashboard values cannot be trusted. "
+            "This version fixes the merge issue for new outputs. Please rerun it on the original Fuels Summary file. "
+            f"Problematic ranges: {', '.join(bad_merges[:8])}"
+        )
+
+    sums = {
+        "ngo_approved": 0.0,
+        "ngo_disapproved": 0.0,
+        "ngo_frozen": 0.0,
+        "wash_unassigned": 0.0,
+        "wfp_routine": 0.0,
+        "wfp_partners": 0.0,
+        "wfp_bakeries": 0.0,
+        "un_approved": 0.0,
+        "un_unrecognized": 0.0,
+        "health": 0.0,
+        "unknown_entities": 0.0,
+        "communications": 0.0,
+        "unclassified": 0.0,
+    }
+
+    source_rows = []
+    for r in range(header_row + 1, source_ws.max_row + 1):
+        cluster = source_ws.cell(r, cols["Cluster"]).value
+        agency = source_ws.cell(r, cols.get("Agency")).value if cols.get("Agency") else None
+        status = source_ws.cell(r, cols["Status"]).value
+        fuel = safe_float(source_ws.cell(r, fuel_col).value)
+        if fuel == 0 and not status:
+            continue
+        category = _dashboard_category(cluster, agency, status)
+        sums[category] = sums.get(category, 0.0) + fuel
+        source_rows.append({
+            "Workbook Row": r,
+            "Cluster": cluster,
+            "Agency": agency,
+            "Status": status,
+            "Unified Fuel": fuel,
+            "Dashboard Category": category,
+        })
+
+    if sheet_name in wb.sheetnames:
+        wb.remove(wb[sheet_name])
+    ws = wb.create_sheet(sheet_name)
+    ws.sheet_view.rightToLeft = False
+
+    # Main table structure matching the requested screenshot.
+    headers = ["סקטור", "פירוט", "כמות", "אחוז"]
+    for c, h in enumerate(headers, start=1):
+        cell = ws.cell(1, c)
+        cell.value = h
+        cell.fill = PatternFill(fill_type="solid", fgColor="262626")
+        cell.font = Font(color="FFFFFF", bold=True, size=13)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = Border(
+            left=Side(style="thin", color="000000"),
+            right=Side(style="thin", color="000000"),
+            top=Side(style="thin", color="000000"),
+            bottom=Side(style="thin", color="000000"),
+        )
+
+    row_specs = [
+        ("NGO", "ארגונים מאושרים", "ngo_approved", "2B8C65", "FFFFFF", False),
+        ("NGO", "ארגונים מסורבים", "ngo_disapproved", "FF0000", "FFFFFF", False),
+        ("NGO", "ארגונים מוקפאים", "ngo_frozen", "FF0000", "FFFFFF", False),
+        (None, "סניטציה ללא שיוך ארגוני", "wash_unassigned", "7563B8", "FFFFFF", True),
+        ("WFP", "פעילות שוטפת", "wfp_routine", "4FB3D8", "FFFFFF", False),
+        ("WFP", "ארגונים שותפים", "wfp_partners", "4FB3D8", "FFFFFF", False),
+        ("WFP", "מאפיות", "wfp_bakeries", "4FB3D8", "FFFFFF", False),
+        ('או"ם', 'סוכנויות או"ם מאושרות', "un_approved", "FFC000", "FFFFFF", False),
+        ('או"ם', 'סוכנויות או"ם לא מוכרות (UN Sisters)', "un_unrecognized", "FF0000", "FFFFFF", False),
+        (None, "בריאות", "health", "6A1BDA", "FFFFFF", True),
+        (None, "ארגונים/גופים לא מוכרים (INGOs/חברות מקומיות)", "unknown_entities", "C044E8", "FFFFFF", True),
+        (None, "תקשורת", "communications", "21A789", "FFFFFF", True),
+    ]
+    if sums.get("unclassified", 0):
+        row_specs.append((None, "לא מסווג", "unclassified", "808080", "FFFFFF", True))
+
+    total = sum(sums.get(key, 0.0) for _, _, key, *_ in row_specs)
+
+    start_row = 2
+    for i, spec in enumerate(row_specs, start=start_row):
+        sector, detail, key, fill_hex, font_hex, merge_detail = spec
+        _write_dashboard_row(ws, i, sector, detail, sums.get(key, 0.0), total, fill_hex, font_hex, merge_detail)
+
+    # Merge group labels vertically (NGO/WFP/UN) after writing row borders/fills.
+    group_ranges = [(2, 4, "NGO", "2B8C65"), (6, 8, "WFP", "4FB3D8"), (9, 10, 'או"ם', "FFC000")]
+    for r1, r2, label, fill_hex in group_ranges:
+        ws.merge_cells(start_row=r1, start_column=1, end_row=r2, end_column=1)
+        cell = ws.cell(r1, 1)
+        cell.value = label
+        cell.fill = PatternFill(fill_type="solid", fgColor=fill_hex)
+        cell.font = Font(color="FFFFFF", bold=True, size=16)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        for r in range(r1, r2 + 1):
+            ws.cell(r, 1).border = Border(
+                left=Side(style="thin", color="000000"),
+                right=Side(style="thin", color="000000"),
+                top=Side(style="thin", color="000000"),
+                bottom=Side(style="thin", color="000000"),
+            )
+
+    ws.column_dimensions["A"].width = 16
+    ws.column_dimensions["B"].width = 42
+    ws.column_dimensions["C"].width = 16
+    ws.column_dimensions["D"].width = 12
+    for r in range(1, ws.max_row + 1):
+        ws.row_dimensions[r].height = 28
+
+    # Keep this sheet clean: only the requested Hebrew summary table is created here.
+
+    return sums, pd.DataFrame(source_rows)
+
+def add_status_to_fuels_summary_workbook(fuels_summary_file, approval_index, prefixes, include_match_details=False):
+    raw = BytesIO(fuels_summary_file.getvalue())
+    wb = load_workbook(raw)
+
+    if DISTRIBUTION_SHEET_NAME not in wb.sheetnames:
+        raise RuntimeError(f'Could not find sheet "{DISTRIBUTION_SHEET_NAME}" in {fuels_summary_file.name}.')
+
+    ws = wb[DISTRIBUTION_SHEET_NAME]
+    headers = {
+        "Cluster": ["Cluster"],
+        "Agency": ["AGENCY", "Agency"],
+        "Description": ["DESCRIPTION", "Description"],
+    }
+    header_row, cols = find_header_row_and_columns(ws, headers, max_scan_rows=5)
+    if not header_row:
+        raise RuntimeError('Could not find Cluster / AGENCY / DESCRIPTION headers in Distribution Summary.')
+
+    status_col, inserted = get_or_insert_status_column(ws, header_row, cols["Description"])
+
+    detail_headers = ["Match Type", "Match Score", "Matched Cluster/Intervention", "Matched Agency", "Matched Description", "Approval Sheet Row"]
+    detail_cols = {}
+    if include_match_details:
+        start_col = ws.max_column + 1
+        for i, h in enumerate(detail_headers):
+            c = start_col + i
+            detail_cols[h] = c
+            cell = ws.cell(header_row, c)
+            cell.value = h
+            copy_cell_style(ws.cell(header_row, status_col), cell)
+            ws.column_dimensions[get_column_letter(c)].width = 24
+
+    review_rows = []
+    for r in range(header_row + 1, ws.max_row + 1):
+        cluster = ws.cell(r, cols["Cluster"]).value
+        agency = ws.cell(r, cols["Agency"]).value
+        desc = ws.cell(r, cols["Description"]).value
+        if not any([cluster, agency, desc]):
+            continue
+
+        review = review_summary_row(cluster, agency, desc, approval_index, prefixes)
+        status_cell = ws.cell(r, status_col)
+        status_cell.value = review["Review Status"]
+
+        # Use the row's existing style, then color only the status cell for easy review.
+        copy_cell_style(ws.cell(r, cols["Description"]), status_cell)
+        status_cell.fill = status_fill(review["Review Status"])
+        status_cell.font = Font(bold=True, color="000000")
+        status_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        if include_match_details:
+            for h in detail_headers:
+                c = detail_cols[h]
+                ws.cell(r, c).value = review[h]
+                copy_cell_style(status_cell, ws.cell(r, c))
+                ws.cell(r, c).fill = PatternFill(fill_type=None)
+                ws.cell(r, c).font = Font(bold=False, color="000000")
+
+        review_rows.append({
+            "Workbook Row": r,
+            "Detected Org": review["Detected Org"],
+            "Cluster": cluster,
+            "Agency": agency,
+            "Description": desc,
+            "Review Status": review["Review Status"],
+            "Match Type": review["Match Type"],
+            "Match Score": review["Match Score"],
+            "Matched Cluster/Intervention": review["Matched Cluster/Intervention"],
+            "Matched Agency": review["Matched Agency"],
+            "Matched Description": review["Matched Description"],
+            "Approval Sheet Row": review["Approval Sheet Row"],
+        })
+
+    # Header styling for the new status column.
+    header_cell = ws.cell(header_row, status_col)
+    header_cell.value = STATUS_COL_NAME
+    header_cell.fill = PatternFill(fill_type="solid", fgColor="000000")
+    header_cell.font = Font(color="FFFFFF", bold=True)
+    header_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # Status Review Log removed per final request.
+    # Keep Distribution Summary usable, but filter only real header columns.
+    ws.freeze_panes = "A2"
+    _set_autofilter_to_real_headers(ws, header_row=header_row)
+
+    # Build the requested Hebrew dashboard sheet from row-level Unified Fuel values
+    # BEFORE deleting helper columns.
+    add_status_dashboard_sheet(wb, ws, header_row=header_row)
+
+    # Remove internal helper columns from the final Distribution Summary.
+    _delete_columns_by_headers(ws, header_row, ["Fuel sum", "Description Sum"])
+    _set_autofilter_to_real_headers(ws, header_row=header_row)
+
+    # Remove legacy QA sheet if present.
+    if "Status Review Log" in wb.sheetnames:
+        wb.remove(wb["Status Review Log"])
+
+    # Apply final formatting/layout requests.
+    apply_final_workbook_layout(wb)
+
+    out = BytesIO()
+    wb.save(out)
+    out.seek(0)
+
+    return out, pd.DataFrame(review_rows)
+
+
+
+
+# ============================================================
+# Persistent approval workbook helper
+# ============================================================
+APPROVAL_STORE_PATH = "חלוקת דלקים לארגונים מאושרים, מסורבים ומוקפאים.xlsx"
+
+class LocalWorkbookFile:
+    def __init__(self, path):
+        self.path = path
+        self.name = os.path.basename(path)
+        self.size = os.path.getsize(path) if os.path.exists(path) else 0
+
+    def getvalue(self):
+        with open(self.path, "rb") as f:
+            return f.read()
+
+class BytesWorkbookFile:
+    def __init__(self, name, data):
+        self.name = name
+        self._data = data
+        self.size = len(data)
+
+    def getvalue(self):
+        return self._data
+
+def get_saved_approval_file():
+    if os.path.exists(APPROVAL_STORE_PATH):
+        return LocalWorkbookFile(APPROVAL_STORE_PATH)
+    return None
+
+def save_uploaded_approval_file(uploaded_file):
+    with open(APPROVAL_STORE_PATH, "wb") as f:
+        f.write(uploaded_file.getvalue())
+    return LocalWorkbookFile(APPROVAL_STORE_PATH)
+
+
+# ============================================================
 # UI: Upload → combine/calculations → add Fuel Dashboard → download
 # ============================================================
+
 left, right = st.columns([2, 1])
 
 with left:
     st.markdown('<div class="card">', unsafe_allow_html=True)
+
+    approval_upload = st.file_uploader(
+        "Upload/update approval list once",
+        type=["xlsx"],
+        key="approval_upload_once",
+        help="Upload חלוקת דלקים לארגונים מאושרים, מסורבים ומוקפאים once. The app saves it and uses the saved copy in future runs.",
+    )
+
+    if approval_upload is not None:
+        try:
+            save_uploaded_approval_file(approval_upload)
+            st.success(f"Approval list saved locally as {APPROVAL_STORE_PATH}")
+        except Exception as e:
+            st.error(f"Could not save approval workbook: {e}")
+
+    saved_approval = get_saved_approval_file()
+    if saved_approval is not None:
+        st.caption(f"Using saved approval workbook: {saved_approval.name}")
+    else:
+        st.warning("No saved approval workbook found yet. Upload it once before running.")
+
     uploads = st.file_uploader(
         "Upload Total Distribution .xlsx files",
         type=["xlsx"],
@@ -1946,7 +3091,7 @@ with left:
         key="latest_day_uploads",
     )
     st.markdown(
-        '<div class="small">First uploader runs the original combiner/calculations. Second uploader adds the Fuel Dashboard as an extra sheet in the same output file.</div>',
+        '<div class="small">The approval workbook is saved locally after one upload. The final workbook will include Distribution Summary, Sector Summary, Fuel Dashboard, and סטטוס לפי אישורים.</div>',
         unsafe_allow_html=True,
     )
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1961,7 +3106,9 @@ with right:
 3) Create Distribution Summary  
 4) Create Sector Summary  
 5) Add Fuel Dashboard sheet from latest-day files  
-6) Download final workbook
+6) Add סטטוס review from saved approval list  
+7) Add סטטוס לפי אישורים summary table  
+8) Download final workbook
 """
     )
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1985,6 +3132,7 @@ def _reset_cached_output():
     st.session_state.pop("final_bytes", None)
     st.session_state.pop("final_name", None)
     st.session_state.pop("debug_logs", None)
+    st.session_state.pop("status_review_summary", None)
     st.session_state.pop("last_upload_key", None)
 
 
@@ -2000,6 +3148,8 @@ if latest_day_uploads:
     upload_key_parts.extend([f"dash:{u.name}:{u.size}" for u in latest_day_uploads])
 if start_date and end_date:
     upload_key_parts.append(f"dates:{start_date.isoformat()}:{end_date.isoformat()}")
+if os.path.exists(APPROVAL_STORE_PATH):
+    upload_key_parts.append(f"approval:{os.path.getsize(APPROVAL_STORE_PATH)}:{os.path.getmtime(APPROVAL_STORE_PATH)}")
 
 upload_key = "|".join(upload_key_parts)
 if upload_key and st.session_state.last_upload_key != upload_key:
@@ -2007,9 +3157,13 @@ if upload_key and st.session_state.last_upload_key != upload_key:
     st.session_state.pop("final_bytes", None)
     st.session_state.pop("final_name", None)
     st.session_state.pop("debug_logs", None)
+    st.session_state.pop("status_review_summary", None)
 
 if "final_bytes" in st.session_state and st.session_state.get("final_bytes"):
     st.success("Done! Download your final file below.")
+    if st.session_state.get("status_review_summary"):
+        with st.expander("Status review summary"):
+            st.dataframe(pd.DataFrame(st.session_state.status_review_summary), use_container_width=True)
     if st.session_state.get("debug_logs"):
         with st.expander("Fuel Dashboard debug logs"):
             st.text("\n".join(st.session_state.debug_logs))
@@ -2030,12 +3184,15 @@ if run_btn:
 
     try:
         debug_logs = []
+        approval_source = get_saved_approval_file()
+        if approval_source is None:
+            raise RuntimeError("Please upload the approval/status workbook once before running.")
 
-        status.info("Step 1/3: Combining Total Distribution files…")
+        status.info("Step 1/4: Combining Total Distribution files…")
         progress.progress(5)
         combined_bytes = build_combined_workbook_bytes(uploads, status=status)
 
-        status.info("Step 2/3: Running Fuels Cleaner calculations…")
+        status.info("Step 2/4: Running Fuels Cleaner calculations…")
         progress.progress(25)
         final_bytes = run_calculations_on_combined_bytes(combined_bytes, progress=progress, status=status)
 
@@ -2043,8 +3200,8 @@ if run_btn:
             if not selected_dates:
                 raise RuntimeError("Please select valid week start and end dates for the Fuel Dashboard.")
 
-            status.info("Step 3/3: Adding Fuel Dashboard sheet…")
-            progress.progress(95)
+            status.info("Step 3/4: Adding Fuel Dashboard sheet…")
+            progress.progress(85)
 
             final_bytes.seek(0)
             final_wb = load_workbook(final_bytes)
@@ -2062,12 +3219,38 @@ if run_btn:
         else:
             status.warning("No latest-day UNOPS/WFP files uploaded, so Fuel Dashboard was not added.")
 
+        status.info("Step 4/4: Adding approval status review and סטטוס לפי אישורים sheet…")
+        progress.progress(94)
+        approval_index, prefixes, approval_df = build_approval_index(approval_source)
+        final_bytes.seek(0)
+        reviewed_excel, review_df = add_status_to_fuels_summary_workbook(
+            BytesWorkbookFile("generated_fuels_summary.xlsx", final_bytes.getvalue()),
+            approval_index,
+            prefixes,
+            include_match_details=False,
+        )
+        final_bytes = reviewed_excel
+
+        if review_df is not None and not review_df.empty:
+            status_summary_df = (
+                review_df.groupby(["Detected Org", "Review Status", "Match Type"], dropna=False)
+                .size()
+                .reset_index(name="Count")
+                .sort_values(["Detected Org", "Review Status", "Match Type"])
+            )
+            st.session_state.status_review_summary = status_summary_df.to_dict("records")
+        else:
+            st.session_state.status_review_summary = []
+
         progress.progress(100)
         st.session_state.final_bytes = final_bytes.getvalue()
         st.session_state.final_name = "Fuels summary.xlsx"
         st.session_state.debug_logs = debug_logs
 
         status.success("Done! Download your final file below.")
+        if st.session_state.get("status_review_summary"):
+            with st.expander("Status review summary"):
+                st.dataframe(pd.DataFrame(st.session_state.status_review_summary), use_container_width=True)
         if debug_logs:
             with st.expander("Fuel Dashboard debug logs"):
                 st.text("\n".join(debug_logs))
