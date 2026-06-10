@@ -2579,16 +2579,128 @@ def _auto_fit_columns(ws, min_width=10, max_width=55):
             ws.column_dimensions[letter].width = min(max(max_len + 3, min_width), max_width)
 
 
+def _row_has_any_real_value(ws, row_num, max_col=None):
+    max_col = max_col or ws.max_column
+    for c in range(1, max_col + 1):
+        value = ws.cell(row_num, c).value
+        if value is not None and str(value).strip() != "":
+            return True
+    return False
+
+
+def remerge_total_sum_per_category(ws, header_row=1):
+    """Rebuild the Total Sum Per Category merges without touching other columns.
+
+    This is run at the very end because column deletion/style operations can
+    disturb merged ranges. The values are recalculated from row-level Unified
+    Fuel, then Total Sum Per Category is merged only by consecutive Cluster
+    groups.
+    """
+    total_col = _find_header_col_exact(ws, "Total Sum Per Category", header_row=header_row)
+    if total_col is None:
+        return
+
+    cluster_col = _find_header_col_exact(ws, "Cluster", header_row=header_row)
+    if cluster_col is None:
+        cluster_col = _find_header_col_exact(ws, "INTERVENTION", header_row=header_row)
+    if cluster_col is None:
+        cluster_col = 1
+
+    unified_col = _find_header_col_exact(ws, "Unified Fuel", header_row=header_row)
+
+    # Unmerge only ranges intersecting Total Sum Per Category, preserving values/styles.
+    for mr in list(ws.merged_cells.ranges):
+        if mr.min_col <= total_col <= mr.max_col and mr.max_row > header_row:
+            top = ws.cell(mr.min_row, total_col)
+            top_value = top.value
+            top_style = copy(top._style)
+            top_font = copy(top.font)
+            top_alignment = copy(top.alignment)
+            top_number_format = top.number_format
+            top_protection = copy(top.protection)
+            top_fill = copy(top.fill)
+            ws.unmerge_cells(str(mr))
+            for r in range(mr.min_row, mr.max_row + 1):
+                cell = ws.cell(r, total_col)
+                cell.value = top_value
+                cell._style = copy(top_style)
+                cell.font = copy(top_font)
+                cell.alignment = copy(top_alignment)
+                cell.number_format = top_number_format
+                cell.protection = copy(top_protection)
+                cell.fill = copy(top_fill)
+
+    # Recalculate total per cluster from the reliable row-level Unified Fuel column.
+    if unified_col is not None:
+        totals = {}
+        for r in range(header_row + 1, ws.max_row + 1):
+            if not _row_has_any_real_value(ws, r, max_col=ws.max_column):
+                continue
+            key = "" if ws.cell(r, cluster_col).value is None else str(ws.cell(r, cluster_col).value).strip()
+            totals[key] = totals.get(key, 0.0) + safe_float(ws.cell(r, unified_col).value)
+
+        for r in range(header_row + 1, ws.max_row + 1):
+            key = "" if ws.cell(r, cluster_col).value is None else str(ws.cell(r, cluster_col).value).strip()
+            if key in totals:
+                ws.cell(r, total_col).value = totals[key]
+
+    # Rebuild merges by consecutive cluster groups.
+    r = header_row + 1
+    while r <= ws.max_row:
+        if not _row_has_any_real_value(ws, r, max_col=ws.max_column):
+            r += 1
+            continue
+
+        key = "" if ws.cell(r, cluster_col).value is None else str(ws.cell(r, cluster_col).value).strip().upper()
+        start = r
+        end = r
+        rr = r + 1
+        while rr <= ws.max_row:
+            if not _row_has_any_real_value(ws, rr, max_col=ws.max_column):
+                break
+            next_key = "" if ws.cell(rr, cluster_col).value is None else str(ws.cell(rr, cluster_col).value).strip().upper()
+            if next_key != key:
+                break
+            end = rr
+            rr += 1
+
+        top = ws.cell(start, total_col)
+        top_value = top.value
+        top_style = copy(top._style)
+        top_font = copy(top.font)
+        top_alignment = copy(top.alignment)
+        top_number_format = top.number_format
+        top_protection = copy(top.protection)
+        top_fill = copy(top.fill)
+
+        if end > start:
+            ws.merge_cells(start_row=start, start_column=total_col, end_row=end, end_column=total_col)
+
+        top = ws.cell(start, total_col)
+        top.value = top_value
+        top._style = copy(top_style)
+        top.font = copy(top_font)
+        top.alignment = copy(top_alignment)
+        top.number_format = top_number_format
+        top.protection = copy(top_protection)
+        top.fill = copy(top_fill)
+
+        r = end + 1
+
+
 def style_distribution_summary_final(ws):
     """Final requested styling for Distribution Summary."""
+    # Reapply the merge first, then style; no borders are applied to the
+    # Total Sum Per Category column, but all other requested styling is applied.
+    remerge_total_sum_per_category(ws, header_row=1)
+
     border = _thin_black_border()
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     total_cat_col = _find_header_col_exact(ws, "Total Sum Per Category", header_row=1)
 
     for row in ws.iter_rows():
         for cell in row:
-            # Do not touch Total Sum Per Category; this keeps its merged ranges/styles intact.
-            if total_cat_col is not None and cell.column == total_cat_col:
+            if isinstance(cell, MergedCell):
                 continue
 
             # Style only cells that actually contain values/text; do not format the full sheet.
@@ -2596,12 +2708,14 @@ def style_distribution_summary_final(ws):
                 continue
 
             cell.alignment = center
-            cell.border = border
             font_color = "FFFFFF" if cell.row == 1 else "000000"
             cell.font = _font_with(cell, name="Calibri", size=11, color=font_color, bold=False if cell.row != 1 else True, italic=False)
 
-    _set_autofilter_to_real_headers(ws, header_row=1)
+            # Apply all borders only outside Total Sum Per Category.
+            if total_cat_col is None or cell.column != total_cat_col:
+                cell.border = border
 
+    _set_autofilter_to_real_headers(ws, header_row=1)
 
 def style_sector_summary_final(ws):
     """Final requested styling for Sector Summary."""
@@ -3060,7 +3174,8 @@ def add_status_to_fuels_summary_workbook(fuels_summary_file, approval_index, pre
 # ============================================================
 # Persistent approval workbook helper
 # ============================================================
-APPROVAL_STORE_PATH = "חלוקת דלקים לארגונים מאושרים, מסורבים ומוקפאים.xlsx"
+APPROVAL_FILE_NAME = "חלוקת דלקים לארגונים מאושרים, מסורבים ומוקפאים.xlsx"
+APPROVAL_STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), APPROVAL_FILE_NAME) if "__file__" in globals() else APPROVAL_FILE_NAME
 
 class LocalWorkbookFile:
     def __init__(self, path):
@@ -3101,25 +3216,11 @@ left, right = st.columns([2, 1])
 with left:
     st.markdown('<div class="card">', unsafe_allow_html=True)
 
-    approval_upload = st.file_uploader(
-        "Upload/update approval list once",
-        type=["xlsx"],
-        key="approval_upload_once",
-        help="Upload חלוקת דלקים לארגונים מאושרים, מסורבים ומוקפאים once. The app saves it and uses the saved copy in future runs.",
-    )
-
-    if approval_upload is not None:
-        try:
-            save_uploaded_approval_file(approval_upload)
-            st.success(f"Approval list saved locally as {APPROVAL_STORE_PATH}")
-        except Exception as e:
-            st.error(f"Could not save approval workbook: {e}")
-
     saved_approval = get_saved_approval_file()
     if saved_approval is not None:
-        st.caption(f"Using saved approval workbook: {saved_approval.name}")
+        st.caption(f"Using local approval workbook: {saved_approval.name}")
     else:
-        st.warning("No saved approval workbook found yet. Upload it once before running.")
+        st.warning(f"Approval workbook was not found next to the app file: {APPROVAL_FILE_NAME}")
 
     uploads = st.file_uploader(
         "Upload Total Distribution .xlsx files",
@@ -3134,7 +3235,7 @@ with left:
         key="latest_day_uploads",
     )
     st.markdown(
-        '<div class="small">The approval workbook is saved locally after one upload. The final workbook will include Distribution Summary, Sector Summary, Fuel Dashboard, and סטטוס לפי אישורים.</div>',
+        '<div class="small">The app reads the approval workbook directly from the code folder. The final workbook will include Distribution Summary, Sector Summary, Fuel Dashboard, and סטטוס לפי אישורים.</div>',
         unsafe_allow_html=True,
     )
     st.markdown("</div>", unsafe_allow_html=True)
@@ -3149,7 +3250,7 @@ with right:
 3) Create Distribution Summary  
 4) Create Sector Summary  
 5) Add Fuel Dashboard sheet from latest-day files  
-6) Add סטטוס review from saved approval list  
+6) Add סטטוס review from local approval list  
 7) Add סטטוס לפי אישורים summary table  
 8) Download final workbook
 """
@@ -3229,7 +3330,7 @@ if run_btn:
         debug_logs = []
         approval_source = get_saved_approval_file()
         if approval_source is None:
-            raise RuntimeError("Please upload the approval/status workbook once before running.")
+            raise RuntimeError(f"Approval/status workbook was not found next to the app file: {APPROVAL_FILE_NAME}")
 
         status.info("Step 1/4: Combining Total Distribution files…")
         progress.progress(5)
