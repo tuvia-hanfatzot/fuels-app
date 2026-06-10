@@ -2557,54 +2557,98 @@ def _set_autofilter_to_real_headers(ws, header_row=1):
         ws.auto_filter.ref = None
 
 
+def _find_header_col_exact(ws, header_text, header_row=1):
+    target = str(header_text).strip().upper()
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(header_row, c).value
+        if v is not None and str(v).strip().upper() == target:
+            return c
+    return None
+
+
+def _auto_fit_columns(ws, min_width=10, max_width=55):
+    for c in range(1, ws.max_column + 1):
+        letter = get_column_letter(c)
+        max_len = 0
+        for r in range(1, ws.max_row + 1):
+            value = ws.cell(r, c).value
+            if value is None:
+                continue
+            max_len = max(max_len, len(str(value)))
+        if max_len:
+            ws.column_dimensions[letter].width = min(max(max_len + 3, min_width), max_width)
+
+
 def style_distribution_summary_final(ws):
     """Final requested styling for Distribution Summary."""
     border = _thin_black_border()
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    total_cat_col = _find_header_col_exact(ws, "Total Sum Per Category", header_row=1)
+
     for row in ws.iter_rows():
         for cell in row:
+            # Do not touch Total Sum Per Category; this keeps its merged ranges/styles intact.
+            if total_cat_col is not None and cell.column == total_cat_col:
+                continue
+
+            # Style only cells that actually contain values/text; do not format the full sheet.
+            if cell.value is None or str(cell.value).strip() == "":
+                continue
+
             cell.alignment = center
             cell.border = border
             font_color = "FFFFFF" if cell.row == 1 else "000000"
-            cell.font = _font_with(cell, name="Calibri", size=11, color=font_color, italic=False)
+            cell.font = _font_with(cell, name="Calibri", size=11, color=font_color, bold=False if cell.row != 1 else True, italic=False)
+
     _set_autofilter_to_real_headers(ws, header_row=1)
 
 
 def style_sector_summary_final(ws):
     """Final requested styling for Sector Summary."""
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    un_agencies_fill = PatternFill(fill_type="solid", fgColor="013D59")
+
     for row in ws.iter_rows():
         for cell in row:
             if cell.value is None:
                 continue
             cell.alignment = center
-            # Apply Aduma to Hebrew words and numbers. This covers the Hebrew labels and values.
-            if _has_hebrew(cell.value) or _is_number_like(cell.value) or (isinstance(cell.value, str) and cell.value.startswith("=")):
-                cell.font = _font_with(cell, name="Aduma", size=20, color="000000")
-            else:
-                cell.font = _font_with(cell, size=20, color="000000")
 
-    # Make סוכנויות או"ם row text/value white.
+            color = "FFFFFF" if cell.row == 1 else "000000"
+            font_name = "Aduma" if (_has_hebrew(cell.value) or _is_number_like(cell.value) or (isinstance(cell.value, str) and cell.value.startswith("="))) else None
+            cell.font = _font_with(cell, name=font_name, size=20, color=color, bold=False, italic=False)
+
+    # Header row text should be white.
+    for c in range(1, ws.max_column + 1):
+        cell = ws.cell(1, c)
+        if cell.value is not None and str(cell.value).strip() != "":
+            cell.font = _font_with(cell, color="FFFFFF", bold=False, italic=False)
+
+    # סוכנויות או"ם row: dark blue fill #013D59 and white text/value.
     for r in range(1, ws.max_row + 1):
         val = ws.cell(r, 1).value
         if val is not None and str(val).strip() == 'סוכנויות או"ם':
             for c in range(1, min(ws.max_column, 3) + 1):
-                ws.cell(r, c).font = _font_with(ws.cell(r, c), color="FFFFFF")
+                cell = ws.cell(r, c)
+                cell.fill = un_agencies_fill
+                cell.font = _font_with(cell, color="FFFFFF", bold=False, italic=False)
+
+    _auto_fit_columns(ws, min_width=12, max_width=60)
 
 
 def style_fuel_dashboard_final(ws):
     """Final requested styling for Fuel Dashboard."""
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    # Top table A1:D4 -> Aduma 16 for Hebrew/numbers.
+    # Top table A1:D4 -> Aduma 16 for Hebrew/numbers, no bold.
     for r in range(1, min(ws.max_row, 4) + 1):
         for c in range(1, min(ws.max_column, 4) + 1):
             cell = ws.cell(r, c)
             cell.alignment = center
             if _has_hebrew(cell.value) or _is_number_like(cell.value):
-                cell.font = _font_with(cell, name="Aduma", size=16)
+                cell.font = _font_with(cell, name="Aduma", size=16, bold=False, italic=False)
             else:
-                cell.font = _font_with(cell, size=16)
+                cell.font = _font_with(cell, size=16, bold=False, italic=False)
 
     # Bottom tables from row 7 down -> size 12, Aduma for Hebrew/numbers.
     for r in range(7, ws.max_row + 1):
@@ -2612,9 +2656,9 @@ def style_fuel_dashboard_final(ws):
             cell = ws.cell(r, c)
             cell.alignment = center
             if _has_hebrew(cell.value) or _is_number_like(cell.value):
-                cell.font = _font_with(cell, name="Aduma", size=12)
+                cell.font = _font_with(cell, name="Aduma", size=12, bold=False, italic=False)
             elif cell.value is not None:
-                cell.font = _font_with(cell, size=12)
+                cell.font = _font_with(cell, size=12, bold=False, italic=False)
 
 
 def style_status_dashboard_final(ws):
@@ -2624,10 +2668,9 @@ def style_status_dashboard_final(ws):
         for cell in row:
             cell.alignment = center
             if _has_hebrew(cell.value) or _is_number_like(cell.value):
-                cell.font = _font_with(cell, name="Aduma", size=12)
+                cell.font = _font_with(cell, name="Aduma", size=12, bold=False, italic=False)
             elif cell.value is not None:
-                cell.font = _font_with(cell, size=12)
-
+                cell.font = _font_with(cell, size=12, bold=False, italic=False)
 
 def move_sheet_before(wb, sheet_name, before_sheet_name):
     if sheet_name not in wb.sheetnames or before_sheet_name not in wb.sheetnames:
