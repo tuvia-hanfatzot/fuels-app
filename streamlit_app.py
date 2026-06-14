@@ -347,19 +347,20 @@ def _merge_wfp_blocks_in_master(master_ws, max_col):
 
 
 def _clear_merges_on_cols(ws, cols=(1, 2), from_row=DATA_START_ROW):
-    kept = []
+    to_unmerge = []
+
     for mr in list(ws.merged_cells.ranges):
         min_c, min_r, max_c, max_r = range_boundaries(str(mr))
 
         if max_r < from_row:
-            kept.append(mr)
             continue
 
         intersects_cols = any(min_c <= col <= max_c for col in cols)
-        if not intersects_cols:
-            kept.append(mr)
+        if intersects_cols:
+            to_unmerge.append(str(mr))
 
-    ws.merged_cells.ranges = kept
+    for rng in to_unmerge:
+        ws.unmerge_cells(rng)
 
 
 def _merge_down_by_blanks(ws, col, max_col, from_row=DATA_START_ROW):
@@ -415,13 +416,16 @@ def _merge_down_by_blanks(ws, col, max_col, from_row=DATA_START_ROW):
 
 
 def _clear_merges_intersecting_cols(ws, col_start, col_end):
-    kept = []
+    to_unmerge = []
+
     for mr in list(ws.merged_cells.ranges):
         min_c, min_r, max_c, max_r = range_boundaries(str(mr))
+
         if not (max_c < col_start or min_c > col_end):
-            continue
-        kept.append(mr)
-    ws.merged_cells.ranges = kept
+            to_unmerge.append(str(mr))
+
+    for rng in to_unmerge:
+        ws.unmerge_cells(rng)
 
 
 def _delete_cols_safe(ws, col_start, col_end):
@@ -430,6 +434,18 @@ def _delete_cols_safe(ws, col_start, col_end):
         if col <= ws.max_column:
             ws.delete_cols(col, 1)
 
+def _ensure_real_cell(ws, row, col):
+    """
+    Converts a stale MergedCell into a normal writable Cell.
+    This is only needed because old code directly edited ws.merged_cells.ranges.
+    """
+    cell = ws.cell(row=row, column=col)
+
+    if isinstance(cell, MergedCell):
+        ws._cells.pop((row, col), None)
+        cell = ws.cell(row=row, column=col)
+
+    return cell
 
 def build_combined_workbook_bytes(uploads, status=None):
     """
@@ -2621,7 +2637,7 @@ def remerge_total_sum_per_category(ws, header_row=1):
             top_fill = copy(top.fill)
             ws.unmerge_cells(str(mr))
             for r in range(mr.min_row, mr.max_row + 1):
-                cell = ws.cell(r, total_col)
+                cell = _ensure_real_cell(ws, r, total_col)
                 cell.value = top_value
                 cell._style = copy(top_style)
                 cell.font = copy(top_font)
@@ -2642,7 +2658,8 @@ def remerge_total_sum_per_category(ws, header_row=1):
         for r in range(header_row + 1, ws.max_row + 1):
             key = "" if ws.cell(r, cluster_col).value is None else str(ws.cell(r, cluster_col).value).strip()
             if key in totals:
-                ws.cell(r, total_col).value = totals[key]
+                target = _ensure_real_cell(ws, r, total_col)
+                target.value = totals[key]
 
     # Rebuild merges by consecutive cluster groups.
     r = header_row + 1
