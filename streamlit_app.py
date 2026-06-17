@@ -714,6 +714,111 @@ def remove_bold_except_header(ws, header_row=1):
             if f is not None and f.bold:
                 cell.font = _font_without_bold(f)
 
+
+def _find_header_col_by_names(ws, header_row, header_names):
+    """Find a column by one of several header names using the existing normaliser."""
+    wanted = {norm_header(name) for name in header_names}
+    for c in range(1, ws.max_column + 1):
+        if norm_header(ws.cell(row=header_row, column=c).value) in wanted:
+            return c
+    return None
+
+
+def _strip_leading_usage_marker(value):
+    """
+    New UNOPS format can prefix Description values with:
+      - Internal use -
+      - external use
+    Return (clean_value, usage_type). usage_type is 'internal', 'external', or None.
+    """
+    if value is None:
+        return value, None
+
+    text_value = str(value)
+    pattern = re.compile(r"^\s*(internal\s+use|external\s+use)\b\s*[-–—:]?\s*", re.IGNORECASE)
+    match = pattern.match(text_value)
+    if not match:
+        return value, None
+
+    usage_type = "internal" if match.group(1).strip().lower().startswith("internal") else "external"
+    clean_value = pattern.sub("", text_value, count=1).strip()
+    return clean_value, usage_type
+
+
+def _compact_alpha_num(value) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"[^A-Z0-9]", "", str(value).upper())
+
+
+def _contains_ohchr(value) -> bool:
+    return "OHCHR" in _compact_alpha_num(value)
+
+
+def _is_regular_cluster_for_internal_use(value) -> bool:
+    """
+    Internal-use rows should become LOGISTICS only when the original cluster is a
+    regular cluster. If the cluster is irregular (for example, UN - Sisters Agencies),
+    keep it untouched so the existing irregular-cluster logic converts it to INGOs
+    with the generated prefix: <cluster> - <agency>.
+    """
+    return norm_header(value) in {
+        "ETC",
+        "HEALTH",
+        "WASH",
+        "INGOS",
+        "UN-OHCHR",
+        "UN OHCHR",
+        "UN AGENCIES",
+        "LOGISTICS",
+    }
+
+
+def normalise_distribution_description_usage_markers(ws, header_row=1):
+    """
+    Normalise the new UNOPS Description format back to the old working format.
+
+    - Removes leading 'Internal use -' / 'external use' from Description.
+    - Internal-use rows become LOGISTICS only when the original cluster is regular.
+      Irregular clusters stay untouched so the existing logic later converts them
+      to INGOs and prefixes the Agency with the original cluster.
+    - OHCHR rows are always treated as LOGISTICS so they later become UN Agencies,
+      not a generated irregular entry such as 'Protection - OHCHR'.
+    - WFP rows are left as WFP to preserve WFP-specific handling.
+    """
+    description_col = _find_header_col_by_names(ws, header_row, ["DESCRIPTION", "Description"])
+    cluster_col = _find_header_col_by_names(ws, header_row, ["CLUSTER", "Cluster", "INTERVENTION", "Intervention"])
+    agency_col = _find_header_col_by_names(ws, header_row, ["AGENCY", "Agency"])
+
+    if description_col is None:
+        return
+
+    for r in range(header_row + 1, ws.max_row + 1):
+        cluster_cell = ws.cell(row=r, column=cluster_col) if cluster_col is not None else None
+        agency_value = ws.cell(row=r, column=agency_col).value if agency_col is not None else None
+        cluster_value = cluster_cell.value if cluster_cell is not None else None
+
+        if cluster_cell is not None and (_contains_ohchr(cluster_value) or _contains_ohchr(agency_value)):
+            cluster_cell.value = "LOGISTICS"
+            cluster_value = cluster_cell.value
+
+        desc_cell = ws.cell(row=r, column=description_col)
+        cleaned_desc, usage_type = _strip_leading_usage_marker(desc_cell.value)
+
+        if usage_type is None:
+            continue
+
+        desc_cell.value = cleaned_desc
+
+        if usage_type == "internal" and cluster_cell is not None:
+            cluster_norm = norm_header(cluster_value)
+
+            # Do not convert WFP rows; the new marker is intended for UNOPS Total Distribution.
+            # Irregular clusters must keep the original cluster so the old irregular-cluster
+            # conversion still produces: <cluster> - <agency>, then Cluster = INGOs.
+            if cluster_norm != "WFP" and _is_regular_cluster_for_internal_use(cluster_value):
+                cluster_cell.value = "LOGISTICS"
+
 def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, status=None) -> BytesIO:
     """
     Takes the combined workbook bytes (with sheet 'Master'),
@@ -795,6 +900,9 @@ def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, s
         progress.progress(34)
 
     header_row = 1
+
+    # Normalise new UNOPS Description prefixes before the existing calculation logic runs.
+    normalise_distribution_description_usage_markers(ws, header_row=header_row)
 
     # Unmerge D–F before Fuel Sum
     unmerge_and_fill(ws, col_min=4, col_max=6)  # D..F
@@ -989,14 +1097,13 @@ def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, s
     if agency_col is None:
         raise RuntimeError('Header "AGENCY" not found.')
 
-    # Normalise: fold UN-OHCHR into INGOs
+    # Normalise OHCHR rows to LOGISTICS so they later become UN Agencies,
+    # even when the source file places OHCHR under an irregular cluster such as Protection.
     for r in range(2, ws.max_row + 1):
-        v = ws.cell(row=r, column=intervention_col).value
-        if v is None:
-            continue
-        t = str(v).strip()
-        if "UN-OHCHR" in t.upper():
-            ws.cell(row=r, column=intervention_col).value = "INGOs"
+        iv = ws.cell(row=r, column=intervention_col).value
+        agency = ws.cell(row=r, column=agency_col).value
+        if _contains_ohchr(iv) or _contains_ohchr(agency):
+            ws.cell(row=r, column=intervention_col).value = "LOGISTICS"
 
     REGULAR_INTERVENTIONS = {
         "ETC",
@@ -1950,6 +2057,7 @@ def add_fuel_dashboard_sheet(
 # Settings
 # ============================================================
 STATUS_COL_NAME = "סטטוס"
+UNKNOWN_ENTITIES_STATUS = "ארגונים/גופים לא מוכרים (INGOs/חברות מקומיות)"
 DISTRIBUTION_SHEET_NAME = "Distribution Summary"
 FUZZY_THRESHOLD = 0.78
 
@@ -1972,6 +2080,8 @@ BASE_GENERATED_PREFIXES = {
     "UN OHCHR",
     "UN - SISTERS LOGISTICS",
     "UN SISTERS LOGISTICS",
+    "UN - SISTERS AGENCIES",
+    "UN SISTERS AGENCIES",
     "PROTECTION",
     "SHELTER",
     "EDUCATION",
@@ -1992,6 +2102,9 @@ STATUS_FILL_RULES = [
     ("תקשורת", "DDEBF7"),
     ("סניטציה", "FCE4D6"),
     ("סוכנויות", "D9EAD3"),
+    ("ארגונים/גופים לא מוכרים", "C044E8"),
+    ("חברות מקומיות", "C044E8"),
+    ("לא מוכרים", "C044E8"),
     ("NOT FOUND", "D9D9D9"),
     ("UNKNOWN", "D9D9D9"),
 ]
@@ -2396,10 +2509,13 @@ def detect_row_source_org(cluster_value) -> str:
 
 
 def review_summary_row(cluster, agency, desc, approval_index, prefixes):
-    # Final Fuels Summary can contain internal WFP operational rows under
-    # Cluster = UN Agencies, Agency = WFP. These are not WFP partner/routine rows;
-    # they should be reviewed as approved UN agency fuel.
-    if norm_text(cluster) == "UN AGENCIES" and norm_text(agency) == "WFP":
+    # Final Fuels Summary can contain internal UN-agency operational rows under
+    # Cluster = UN Agencies. These should be reviewed as approved UN agency fuel
+    # instead of being matched as a regular NGO/organisation row.
+    agency_compact = _compact_alpha_num(agency)
+    if norm_text(cluster) == "UN AGENCIES" and (
+        norm_text(agency) == "WFP" or "OHCHR" in agency_compact
+    ):
         return {
             "Detected Org": "UNOPS",
             "Review Status": 'סוכנויות או"ם מאושרות',
@@ -2470,9 +2586,11 @@ def review_summary_row(cluster, agency, desc, approval_index, prefixes):
             "Approval Sheet Row": match["Approval Sheet Row"],
         }
 
+    no_match_status = UNKNOWN_ENTITIES_STATUS if norm_text(cluster) == "INGOS" else "Not Found"
+
     return {
         "Detected Org": org,
-        "Review Status": "Not Found",
+        "Review Status": no_match_status,
         "Match Type": "No Match",
         "Match Score": round(best_score, 3),
         "Matched Cluster/Intervention": None,
@@ -2874,9 +2992,9 @@ def _dashboard_category(cluster, agency, status):
     s = "" if status is None else str(status).strip()
     su = s.upper()
 
-    # Special rule: WFP operational rows under UN Agencies are approved UN agency fuel,
-    # not WFP routine/partner fuel and not unknown entities.
-    if c == "UN AGENCIES" and a == "WFP":
+    # Special rule: operational rows under UN Agencies for WFP/OHCHR are approved
+    # UN agency fuel, not routine/partner fuel and not unknown entities.
+    if c == "UN AGENCIES" and (a == "WFP" or "OHCHR" in _compact_alpha_num(agency)):
         return "un_approved"
 
     # Dedicated sector/status buckets first.
@@ -3039,7 +3157,7 @@ def add_status_dashboard_sheet(wb, source_ws, header_row=1, sheet_name="סטטו
         ('או"ם', 'סוכנויות או"ם מאושרות', "un_approved", "FFC000", "FFFFFF", False),
         ('או"ם', 'סוכנויות או"ם לא מוכרות (UN Sisters)', "un_unrecognized", "FF0000", "FFFFFF", False),
         (None, "בריאות", "health", "6A1BDA", "FFFFFF", True),
-        (None, "ארגונים/גופים לא מוכרים (INGOs/חברות מקומיות)", "unknown_entities", "C044E8", "FFFFFF", True),
+        (None, UNKNOWN_ENTITIES_STATUS, "unknown_entities", "C044E8", "FFFFFF", True),
         (None, "תקשורת", "communications", "21A789", "FFFFFF", True),
     ]
     if sums.get("unclassified", 0):
