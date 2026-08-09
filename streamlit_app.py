@@ -1701,6 +1701,110 @@ def cell_ref(row, col):
     return f"{get_column_letter(col)}{row}"
 
 
+def _debug_value(value, max_len=90):
+    """Compact repr() so hidden spaces/characters are visible in error messages."""
+    if value is None:
+        return "None"
+    text = repr(value)
+    if len(text) > max_len:
+        text = text[: max_len - 3] + "..."
+    return text
+
+
+def _describe_row(ws, row, start_col=1, end_col=None, include_blanks=False):
+    if row is None or row < 1 or row > ws.max_row:
+        return "(row unavailable)"
+
+    end_col = ws.max_column if end_col is None else min(end_col, ws.max_column)
+    start_col = max(1, start_col)
+    parts = []
+    for c in range(start_col, end_col + 1):
+        value = ws.cell(row=row, column=c).value
+        if not include_blanks and (value is None or str(value).strip() == ""):
+            continue
+        parts.append(f"{cell_ref(row, c)}={_debug_value(value)}")
+    return ", ".join(parts) if parts else "(no non-empty cells)"
+
+
+def _closest_cells(ws, target_text, max_results=6):
+    """Return a few cells whose text most closely resembles the missing label."""
+    target = norm_header(target_text)
+    scored = []
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            value = ws.cell(r, c).value
+            if value is None or str(value).strip() == "":
+                continue
+            candidate = norm_header(value)
+            score = SequenceMatcher(None, target, candidate).ratio()
+            if score >= 0.40:
+                scored.append((score, r, c, value))
+
+    scored.sort(key=lambda x: (-x[0], x[1], x[2]))
+    if not scored:
+        return "(no similar cells found)"
+
+    return "; ".join(
+        f"{cell_ref(r, c)}={_debug_value(value)} ({score:.0%} similar)"
+        for score, r, c, value in scored[:max_results]
+    )
+
+
+def _fuel_structure_error(
+    uploaded_file,
+    wb,
+    ws,
+    *,
+    stage,
+    expected,
+    similar_to=None,
+    reference=None,
+    header_row=None,
+    scan_start_col=None,
+    scan_end_col=None,
+):
+    """Build a detailed error that points to the exact workbook area that failed."""
+    lines = [
+        "Fuel Dashboard structure error",
+        f"File: {uploaded_file.name}",
+        f"Detected organisation: {detect_org(uploaded_file.name)}",
+        f"Stage: {stage}",
+        f"Sheet: {ws.title if ws is not None else '(sheet not found)'}",
+        f"Expected: {expected}",
+        f"Workbook sheets: {list(wb.sheetnames)}",
+    ]
+
+    if reference:
+        lines.append(f"Reference: {reference}")
+
+    if ws is not None:
+        lines.append(f"Sheet size: {ws.max_row} rows x {ws.max_column} columns")
+
+    if header_row is not None:
+        start_col = 1 if scan_start_col is None else scan_start_col
+        end_col = ws.max_column if scan_end_col is None else scan_end_col
+        lines.append(
+            f"Scanned area: row {header_row}, columns "
+            f"{get_column_letter(max(1, start_col))}:{get_column_letter(min(end_col, ws.max_column))}"
+        )
+        lines.append(
+            f"Values on scanned row: {_describe_row(ws, header_row, start_col, end_col, include_blanks=True)}"
+        )
+
+        nearby = []
+        for r in range(max(1, header_row - 2), min(ws.max_row, header_row + 2) + 1):
+            nearby.append(f"Row {r}: {_describe_row(ws, r, start_col, end_col)}")
+        lines.append("Nearby rows:\n  " + "\n  ".join(nearby))
+
+    similarity_target = similar_to or expected
+    lines.append(f"Closest similar cells: {_closest_cells(ws, similarity_target) if ws is not None else '(not available)'}")
+    lines.append(
+        "Likely causes: the header was renamed, moved to another row, merged differently, "
+        "or contains extra/hidden characters."
+    )
+    return RuntimeError("\n".join(lines))
+
+
 def detect_org(filename: str) -> str:
     name = filename.upper()
     if "UNOPS" in name:
@@ -1716,7 +1820,14 @@ def extract_current_fuel_from_file(uploaded_file):
     wb = load_workbook(raw, data_only=True)
 
     if "Summary" not in wb.sheetnames:
-        raise RuntimeError(f'"{uploaded_file.name}" does not contain a Summary sheet.')
+        raise RuntimeError(
+            "Fuel Dashboard structure error\n"
+            f"File: {uploaded_file.name}\n"
+            f"Detected organisation: {org}\n"
+            "Stage: Current fuel by station\n"
+            'Expected sheet: "Summary"\n'
+            f"Workbook sheets found: {list(wb.sheetnames)}"
+        )
 
     ws = wb["Summary"]
 
@@ -1729,24 +1840,63 @@ def extract_current_fuel_from_file(uploaded_file):
 
     header_row, station_col = find_cell_containing(ws, "Fuel Station - Address")
     if not header_row:
-        raise RuntimeError(f'"Fuel Station - Address" not found in "{uploaded_file.name}".')
+        raise _fuel_structure_error(
+            uploaded_file,
+            wb,
+            ws,
+            stage="Current fuel by station",
+            expected='cell containing "Fuel Station - Address"',
+            similar_to="Fuel Station - Address",
+        )
 
     diesel_col = None
     petrol_col = None
-    for c in range(station_col + 1, ws.max_column + 1):
+    scan_start_col = station_col + 1
+    scan_end_col = ws.max_column
+
+    for c in range(scan_start_col, scan_end_col + 1):
         val = ws.cell(header_row, c).value
         txt = "" if val is None else str(val).strip().upper()
-        if txt == "DIESEL":
+        if txt in ("DIESEL", "DIESEL (LITERS)"):
             diesel_col = c
-        elif txt == "PETROL":
+        elif txt in ("PETROL", "PETROL (LITERS)"):
             petrol_col = c
         if diesel_col and petrol_col:
             break
 
     if diesel_col is None:
-        raise RuntimeError(f'"Diesel" column not found in "{uploaded_file.name}".')
+        raise _fuel_structure_error(
+            uploaded_file,
+            wb,
+            ws,
+            stage="Current fuel by station -> Diesel/Petrol header detection",
+            expected='header equal to "Diesel" or "Diesel (Liters)"',
+            similar_to="Diesel",
+            reference=(
+                f'"Fuel Station - Address" found at {cell_ref(header_row, station_col)}; '
+                "Diesel is expected somewhere to its right on the same row"
+            ),
+            header_row=header_row,
+            scan_start_col=scan_start_col,
+            scan_end_col=scan_end_col,
+        )
+
     if petrol_col is None:
-        raise RuntimeError(f'"Petrol" column not found in "{uploaded_file.name}".')
+        raise _fuel_structure_error(
+            uploaded_file,
+            wb,
+            ws,
+            stage="Current fuel by station -> Diesel/Petrol header detection",
+            expected='header equal to "Petrol" or "Petrol (Liters)"',
+            similar_to="Petrol",
+            reference=(
+                f'"Fuel Station - Address" found at {cell_ref(header_row, station_col)}; '
+                "Petrol is expected somewhere to its right on the same row"
+            ),
+            header_row=header_row,
+            scan_start_col=scan_start_col,
+            scan_end_col=scan_end_col,
+        )
 
     rows = []
     seen = set()
@@ -2005,17 +2155,55 @@ def add_fuel_dashboard_sheet(
     fuel_storage_by_org = {}
 
     for uploaded_file in latest_uploads:
-        current_rows = extract_current_fuel_from_file(uploaded_file)
-        all_rows.extend(current_rows)
+        org_guess = detect_org(uploaded_file.name)
 
-        org, org_entries = extract_daily_fuel_entries(uploaded_file, selected_dates)
-        daily_entries[org] = org_entries
+        try:
+            current_rows = extract_current_fuel_from_file(uploaded_file)
+            all_rows.extend(current_rows)
+        except Exception as e:
+            raise RuntimeError(
+                "Fuel Dashboard processing failed\n"
+                f"File: {uploaded_file.name}\n"
+                f"Detected organisation: {org_guess}\n"
+                "Sub-step: 1/4 - Read current fuel by station\n\n"
+                f"Details:\n{e}"
+            ) from e
 
-        org, used_total = extract_fuel_used(uploaded_file, selected_dates, logs=logs)
-        fuel_used_by_org[org] = used_total
+        try:
+            org, org_entries = extract_daily_fuel_entries(uploaded_file, selected_dates)
+            daily_entries[org] = org_entries
+        except Exception as e:
+            raise RuntimeError(
+                "Fuel Dashboard processing failed\n"
+                f"File: {uploaded_file.name}\n"
+                f"Detected organisation: {org_guess}\n"
+                "Sub-step: 2/4 - Read cumulative fuel entries\n\n"
+                f"Details:\n{e}"
+            ) from e
 
-        org, storage_total = extract_fuel_storage(uploaded_file, logs=logs)
-        fuel_storage_by_org[org] = storage_total
+        try:
+            org, used_total = extract_fuel_used(uploaded_file, selected_dates, logs=logs)
+            fuel_used_by_org[org] = used_total
+        except Exception as e:
+            raise RuntimeError(
+                "Fuel Dashboard processing failed\n"
+                f"File: {uploaded_file.name}\n"
+                f"Detected organisation: {org_guess}\n"
+                "Sub-step: 3/4 - Calculate fuel used\n\n"
+                f"Details:\n{e}"
+            ) from e
+
+        try:
+            org, storage_total = extract_fuel_storage(uploaded_file, logs=logs)
+            fuel_storage_by_org[org] = storage_total
+        except Exception as e:
+            raise RuntimeError(
+                "Fuel Dashboard processing failed\n"
+                f"File: {uploaded_file.name}\n"
+                f"Detected organisation: {org_guess}\n"
+                "Sub-step: 4/4 - Read current fuel in storage\n\n"
+                f"Details:\n{e}"
+            ) from e
 
     if sheet_name in wb.sheetnames:
         wb.remove(wb[sheet_name])
@@ -4430,7 +4618,10 @@ if run_btn:
 
     except Exception as e:
         status.empty()
-        st.exception(e)
+        st.error("Processing failed. The diagnostic below shows the exact file and workbook area that caused the problem.")
+        st.code(str(e), language=None)
+        with st.expander("Technical traceback"):
+            st.exception(e)
 
     finally:
         loader.empty()
