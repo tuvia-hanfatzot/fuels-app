@@ -864,6 +864,11 @@ def _contains_ohchr(value) -> bool:
     return "OHCHR" in _compact_alpha_num(value)
 
 
+def _is_wfp_un_agency(agency) -> bool:
+    """Recognise WFP itself and its Food-sector label, excluding partner agencies."""
+    return _compact_alpha_num(agency) in {"WFP", "FOODWFP"}
+
+
 def _is_regular_cluster_for_internal_use(value) -> bool:
     """
     Internal-use rows should become LOGISTICS only when the original cluster is a
@@ -893,7 +898,8 @@ def normalise_distribution_description_usage_markers(ws, header_row=1):
       to INGOs and prefixes the Agency with the original cluster.
     - OHCHR rows are always treated as LOGISTICS so they later become UN Agencies,
       not a generated irregular entry such as 'Protection - OHCHR'.
-    - WFP rows are left as WFP to preserve WFP-specific handling.
+    - Food / WFP (including the generated Food - WFP label) becomes LOGISTICS,
+      then UN Agencies. Rows from the dedicated WFP source remain WFP.
     """
     description_col = _find_header_col_by_names(ws, header_row, ["DESCRIPTION", "Description"])
     cluster_col = _find_header_col_by_names(ws, header_row, ["CLUSTER", "Cluster", "INTERVENTION", "Intervention"])
@@ -908,6 +914,17 @@ def normalise_distribution_description_usage_markers(ws, header_row=1):
         cluster_value = cluster_cell.value if cluster_cell is not None else None
 
         if cluster_cell is not None and (_contains_ohchr(cluster_value) or _contains_ohchr(agency_value)):
+            cluster_cell.value = "LOGISTICS"
+            cluster_value = cluster_cell.value
+
+        # Food - WFP belongs to UN Agencies. Normalise before aggregation,
+        # sorting, category totals, colours, and Sector Summary are generated.
+        if cluster_cell is not None and norm_header(cluster_value) != "WFP" and (
+            _compact_alpha_num(agency_value) == "FOODWFP"
+            or (norm_header(cluster_value) == "FOOD" and _compact_alpha_num(agency_value) == "WFP")
+        ):
+            if norm_header(cluster_value) == "FOOD" and _compact_alpha_num(agency_value) == "WFP":
+                ws.cell(row=r, column=agency_col).value = "Food - WFP"
             cluster_cell.value = "LOGISTICS"
             cluster_value = cluster_cell.value
 
@@ -1208,6 +1225,7 @@ def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, s
         "INGOS",
         "UN-OHCHR",
         "WFP",
+        "UN AGENCIES",
         "LOGISTICS",   # IMPORTANT: exclude from prefix+convert logic
     }
 
@@ -2828,7 +2846,7 @@ def review_summary_row(cluster, agency, desc, approval_index, prefixes):
     # instead of being matched as a regular NGO/organisation row.
     agency_compact = _compact_alpha_num(agency)
     if norm_text(cluster) == "UN AGENCIES" and (
-        norm_text(agency) == "WFP" or "OHCHR" in agency_compact
+        _is_wfp_un_agency(agency) or "OHCHR" in agency_compact
     ):
         return {
             "Detected Org": "UNOPS",
@@ -3322,7 +3340,7 @@ def _dashboard_category(cluster, agency, status):
 
     # Special rule: operational rows under UN Agencies for WFP/OHCHR are approved
     # UN agency fuel, not routine/partner fuel and not unknown entities.
-    if c == "UN AGENCIES" and (a == "WFP" or "OHCHR" in _compact_alpha_num(agency)):
+    if c == "UN AGENCIES" and (_is_wfp_un_agency(agency) or "OHCHR" in _compact_alpha_num(agency)):
         return "un_approved"
 
     # Dedicated sector/status buckets first.
