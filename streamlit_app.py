@@ -20,6 +20,7 @@ from openpyxl.chart.series import DataPoint
 from openpyxl.styles import PatternFill, Font
 
 from datetime import datetime, date, timedelta
+from openpyxl.utils.datetime import from_excel
 
 import gc
 
@@ -1672,6 +1673,11 @@ def normalise_date(v):
         return None
     if isinstance(v, datetime):
         return v.date()
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        try:
+            return from_excel(v).date()
+        except (ValueError, OverflowError, TypeError, AttributeError):
+            return None
     if isinstance(v, date):
         return v
     if isinstance(v, str):
@@ -1785,7 +1791,7 @@ def _fuel_structure_error(
     lines = [
         "Fuel Dashboard structure error",
         f"File: {uploaded_file.name}",
-        f"Detected organisation: {detect_org(uploaded_file.name)}",
+        f"Detected organisation: {detect_org(uploaded_file.name, uploaded_file)}",
         f"Stage: {stage}",
         f"Sheet: {ws.title if ws is not None else '(sheet not found)'}",
         f"Expected: {expected}",
@@ -1823,17 +1829,35 @@ def _fuel_structure_error(
     return RuntimeError("\n".join(lines))
 
 
-def detect_org(filename: str) -> str:
+def detect_org(filename: str, uploaded_file=None) -> str:
+    """Identify source from workbook content, not only its generic filename."""
     name = filename.upper()
     if "UNOPS" in name:
         return "UNOPS"
     if "WFP" in name:
         return "WFP"
-    return "Unknown"
+
+    if uploaded_file is not None:
+        wb = load_workbook(BytesIO(uploaded_file.getvalue()), read_only=True, data_only=True)
+        try:
+            names = {n.strip().upper() for n in wb.sheetnames}
+            if any("UNOPS TOTAL DISTRIBUTION" in n for n in names) or "FUEL RECEIPTS SUMMARY" in names:
+                return "UNOPS"
+            if any("WFP TOTAL DISTRIBUTION" in n for n in names):
+                return "WFP"
+            if "SUMMARY" in names:
+                ws = wb[next(n for n in wb.sheetnames if n.strip().upper() == "SUMMARY")]
+                for row in ws.iter_rows(min_row=1, max_row=35, max_col=6, values_only=True):
+                    if any(isinstance(v, str) and v.strip().upper() == "UNOPS" for v in row):
+                        return "UNOPS"
+        finally:
+            wb.close()
+
+    raise RuntimeError(f"Could not identify UNOPS or WFP for '{filename}'. Check the workbook structure.")
 
 
 def extract_current_fuel_from_file(uploaded_file):
-    org = detect_org(uploaded_file.name)
+    org = detect_org(uploaded_file.name, uploaded_file)
     raw = BytesIO(uploaded_file.getvalue())
     wb = load_workbook(raw, data_only=True)
 
@@ -1952,7 +1976,7 @@ def extract_current_fuel_from_file(uploaded_file):
 
 
 def extract_daily_fuel_entries(uploaded_file, selected_dates):
-    org = detect_org(uploaded_file.name)
+    org = detect_org(uploaded_file.name, uploaded_file)
     raw = BytesIO(uploaded_file.getvalue())
     wb = load_workbook(raw, data_only=True)
 
@@ -2027,7 +2051,7 @@ def extract_daily_fuel_entries(uploaded_file, selected_dates):
     return org, results
 
 def extract_fuel_used(uploaded_file, selected_dates, logs=None):
-    org = detect_org(uploaded_file.name)
+    org = detect_org(uploaded_file.name, uploaded_file)
     add_log(logs, f"========== Fuel Used | {uploaded_file.name} | detected org: {org} ==========")
 
     raw = BytesIO(uploaded_file.getvalue())
@@ -2070,9 +2094,23 @@ def extract_fuel_used(uploaded_file, selected_dates, logs=None):
     total_used = 0.0
     active_diesel_col = None
     active_petrol_col = None
+    carried_date = None
+    carried_date_row = -10
 
     for r in range(sum_row + 1, ws.max_row + 1):
-        current_date = normalise_date(ws.cell(r, date_col).value)
+        row_date = normalise_date(ws.cell(r, date_col).value)
+        # WFP has one date per daily row and undated grand-total/footer rows.
+        # NEVER carry a WFP date into later rows: that counted its entire
+        # cumulative total as part of the final selected day.
+        # UNOPS may put the numbers on the immediately following row only.
+        if org == "WFP":
+            current_date = row_date
+        else:
+            if row_date is not None:
+                carried_date = row_date
+                carried_date_row = r
+            current_date = (row_date if row_date is not None else
+                            carried_date if r == carried_date_row + 1 else None)
         header_pair_found = False
 
         for c in range(sum_start_col, sum_end_col):
@@ -2115,7 +2153,7 @@ def extract_fuel_used(uploaded_file, selected_dates, logs=None):
 
 
 def extract_fuel_storage(uploaded_file, logs=None):
-    org = detect_org(uploaded_file.name)
+    org = detect_org(uploaded_file.name, uploaded_file)
     add_log(logs, f"========== Fuel Storage | {uploaded_file.name} | detected org: {org} ==========")
 
     raw = BytesIO(uploaded_file.getvalue())
@@ -2173,7 +2211,7 @@ def add_fuel_dashboard_sheet(
     fuel_storage_by_org = {}
 
     for uploaded_file in latest_uploads:
-        org_guess = detect_org(uploaded_file.name)
+        org_guess = detect_org(uploaded_file.name, uploaded_file)
 
         try:
             current_rows = extract_current_fuel_from_file(uploaded_file)
