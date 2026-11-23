@@ -1,63 +1,36 @@
-import streamlit as st
-from io import BytesIO
-from copy import copy
-import re
+"""Combine fuel distribution workbooks and build the weekly Excel report.
+
+Run with: streamlit run fuel_report.py
+Keep the approval workbook beside this file. generate_report() also accepts
+file-like uploads directly and can be used without the Streamlit interface.
+"""
+
 import base64
+import hashlib
 import os
+import re
+from contextlib import closing, contextmanager
+from copy import copy
+from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher, get_close_matches
+from functools import lru_cache
+from io import BytesIO
 
 import pandas as pd
-
-from openpyxl import load_workbook, Workbook
-from openpyxl.utils import get_column_letter
-from openpyxl.cell.cell import MergedCell
-from openpyxl.utils.cell import range_boundaries
-
-from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
+from openpyxl import Workbook, load_workbook
+from openpyxl.cell.cell import Cell, MergedCell
+from openpyxl.compat.strings import safe_string
 from openpyxl.chart import PieChart, Reference
 from openpyxl.chart.label import DataLabelList
 from openpyxl.chart.series import DataPoint
-from openpyxl.styles import PatternFill, Font
-
-from datetime import datetime, date, timedelta
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.styles.cell_style import StyleArray
+from openpyxl.styles.numbers import is_date_format, is_timedelta_format
+from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import range_boundaries
 from openpyxl.utils.datetime import from_excel
 
-import gc
 
-
-# ============================================================
-# Streamlit config + UI styling
-# ============================================================
-st.set_page_config(page_title="Total Distribution → Calculations", layout="centered")
-
-st.markdown(
-    """
-<style>
-    .block-container { padding-top: 2rem; max-width: 900px; }
-    .title { font-size: 2rem; font-weight: 800; margin-bottom: .25rem; }
-    .subtitle { color: #6b7280; margin-bottom: 1.25rem; }
-    .card {
-        border: 1px solid rgba(0,0,0,.08);
-        border-radius: 16px;
-        padding: 16px 18px;
-        background: rgba(255,255,255,.6);
-    }
-    .small { font-size: .9rem; color: #6b7280; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-st.markdown('<div class="title">Total Distribution Combiner + Fuels Cleaner</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="subtitle">Upload multiple Total Distribution files → combine first → then run your calculations → download final.</div>',
-    unsafe_allow_html=True,
-)
-
-
-# ============================================================
-# Settings
-# ============================================================
 TARGET_SHEETS = {
     "UNOPS": "UNOPS Total Distribution",
     "WFP": "WFP Total Distribution",
@@ -66,17 +39,98 @@ TARGET_SHEETS = {
 HEADER_ROWS = 2
 DATA_START_ROW = 3
 
-# If you still only want to freeze specific columns in source sheets you can keep this,
-# but we now copy VALUES for *all* cells into the master anyway.
-FREEZE_COLS = (3, 4)  # C, D  (kept for compatibility)
 
-# After combining, delete columns F–I (6..9) before calculations
+FREEZE_COLS = (3, 4)
 DELETE_COMBINED_COLS_F_TO_I_BEFORE_CALC = True
 
 
-# ============================================================
-# Small UI helper (optional loader video)
-# ============================================================
+STATUS_COL_NAME = "סטטוס"
+UNKNOWN_ENTITIES_STATUS = "ארגונים/גופים לא מוכרים (INGOs/חברות מקומיות)"
+DISTRIBUTION_SHEET_NAME = "Distribution Summary"
+FUZZY_THRESHOLD = 0.78
+
+APPROVAL_SHEETS = {
+    "UNOPS": ["UNOPS Total Distribution", "UNOPS Total Distribution "],
+    "WFP": ["WFP Total Distribution"],
+}
+
+
+BASE_GENERATED_PREFIXES = {
+    "NNGOS",
+    "NNGO",
+    "FINANCIAL INSTITUTIONS",
+    "FINANCIAL INSTITUTION",
+    "UN-OHCHR",
+    "UN OHCHR",
+    "UN - SISTERS LOGISTICS",
+    "UN SISTERS LOGISTICS",
+    "UN - SISTERS AGENCIES",
+    "UN SISTERS AGENCIES",
+    "PROTECTION",
+    "SHELTER",
+    "EDUCATION",
+    "NUTRITION",
+    "LOGISTICS",
+    "FOOD SECURITY",
+    "LOCAL AUTHORITIES",
+    "CCCM",
+}
+
+STATUS_FILL_RULES = [
+    ("מסורב", "F4B084"),
+    ("מוקפא", "B4C6E7"),
+    ("מאפיות", "FFE699"),
+    ("מאושר", "C6E0B4"),
+    ("שותפים", "E2F0D9"),
+    ("בריאות", "C6E0B4"),
+    ("תקשורת", "DDEBF7"),
+    ("סניטציה", "FCE4D6"),
+    ("סוכנויות", "D9EAD3"),
+    ("ארגונים/גופים לא מוכרים", "C044E8"),
+    ("חברות מקומיות", "C044E8"),
+    ("לא מוכרים", "C044E8"),
+    ("NOT FOUND", "D9D9D9"),
+    ("UNKNOWN", "D9D9D9"),
+]
+
+
+APPROVAL_FILE_NAME = "חלוקת דלקים לארגונים מאושרים, מסורבים ומוקפאים.xlsx"
+APPROVAL_STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), APPROVAL_FILE_NAME) if "__file__" in globals() else APPROVAL_FILE_NAME
+
+
+def workbook_bytes(workbook):
+    """Serialise a completed workbook and rewind it for the next reader."""
+    output = BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return output
+
+
+def _prepare_excel_values(ws):
+    """Keep the numeric precision and cell types of the former Excel save/reload steps."""
+    date_formats = {}
+    for cell in ws._cells.values():
+        value = cell.value
+        if cell.data_type != "n" or type(value) not in (float, int):
+            continue
+        if isinstance(value, float) or abs(value) >= 10**15:
+            text = safe_string(value)
+            if not text:
+                cell.value = None
+                continue
+            value = float(text) if "." in text or "e" in text.lower() else int(text)
+            cell.value = value
+        fmt = cell.number_format
+        if fmt not in date_formats:
+            date_formats[fmt] = (is_date_format(fmt), is_timedelta_format(fmt))
+        is_date, is_duration = date_formats[fmt]
+        if is_date:
+            try:
+                cell.value = from_excel(value, ws.parent.epoch, timedelta=is_duration)
+            except (OverflowError, ValueError):
+                cell.value = "#VALUE!"
+
+
 def show_small_loader_video(placeholder, path: str, width_px: int = 220):
     try:
         with open(path, "rb") as f:
@@ -96,61 +150,42 @@ def show_small_loader_video(placeholder, path: str, width_px: int = 220):
         placeholder.empty()
 
 
-# ============================================================
-# COMBINER HELPERS
-# ============================================================
+# Combining source worksheets
+
+
 def _norm(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"\s+", " ", s)
-    return s
+    return " ".join((s or "").lower().split())
 
 
 def _find_target_sheet(wb):
-    sheetnames = list(wb.sheetnames)
-    norm_map = {name: _norm(name) for name in sheetnames}
-
-    targets = {
-        "UNOPS": _norm("UNOPS Total Distribution"),
-        "WFP": _norm("WFP Total Distribution"),
-    }
-
-    # 1) Normalised exact match
-    for kind, target_norm in targets.items():
-        for real_name, real_norm in norm_map.items():
-            if real_norm == target_norm:
-                return kind, real_name
-
-    # 2) Broader match
-    for real_name, real_norm in norm_map.items():
-        if "total" in real_norm and "distribution" in real_norm:
-            if "unops" in real_norm:
-                return "UNOPS", real_name
-            if "wfp" in real_norm:
-                return "WFP", real_name
-
+    names = {name: _norm(name) for name in wb.sheetnames}
+    for org, target in TARGET_SHEETS.items():
+        for name, normalised in names.items():
+            if normalised == _norm(target):
+                return org, name
+    for name, normalised in names.items():
+        if "total" in normalised and "distribution" in normalised:
+            for org in TARGET_SHEETS:
+                if org.lower() in normalised:
+                    return org, name
     return None, None
 
 
 def _row_has_data_row(ws, r, max_col):
-    for c in range(1, max_col + 1):
-        if ws.cell(r, c).value not in (None, ""):
-            return True
-    return False
+    return any(ws.cell(r, c).value not in (None, "") for c in range(1, max_col + 1))
 
 
 def _first_data_row(ws, start=DATA_START_ROW, max_scan=200):
-    end = min(ws.max_row, start + max_scan)
-    for r in range(start, end + 1):
-        if _row_has_data_row(ws, r, ws.max_column):
-            return r
-    return start
+    # Inspect existing cells only. A format applied far down a sheet can inflate its dimensions.
+    stop = start + max_scan
+    return min((cell.row for cell in ws._cells.values()
+                if start <= cell.row <= stop and cell.value not in (None, "")), default=start)
 
 
 def _last_data_row(ws, start_row, max_col):
-    for r in range(ws.max_row, start_row - 1, -1):
-        if _row_has_data_row(ws, r, max_col):
-            return r
-    return start_row - 1
+    return max((cell.row for cell in ws._cells.values()
+                if cell.row >= start_row and cell.column <= max_col and cell.value not in (None, "")),
+               default=start_row - 1)
 
 
 def _delete_last_text_row_in_sheet(ws, start_row, end_row, max_col):
@@ -186,50 +221,48 @@ def _safe_value(ws_vals, r, c):
         return None
 
 
-def _copy_block_values_only(src_ws, src_ws_vals, dst_ws, src_row_start, src_row_end, dst_row_start, max_col):
-    """
-    Copy block while:
-    - keeping formatting (styles, row heights, merges)
-    - writing VALUES (not formulas) using src_ws_vals (data_only=True)
-    """
-    row_delta = dst_row_start - src_row_start
+def _copy_style_between_workbooks(src, dst):
+    # Style IDs are local to a workbook. Register each component in the destination.
+    dst._style = copy(src._style)
+    dst.font = copy(src.font)
+    dst.fill = copy(src.fill)
+    dst.border = copy(src.border)
+    dst.alignment = copy(src.alignment)
+    dst.number_format = src.number_format
+    dst.protection = copy(src.protection)
 
+
+def _copy_block_values_only(src_ws, src_ws_vals, dst_ws, src_row_start, src_row_end,
+                            dst_row_start, max_col, style_map=None, formula_values=None):
+    """Copy values, styles and fully contained merges. Share the mapping across blocks."""
+    if style_map is None:
+        style_map = {}
+    offset = dst_row_start - src_row_start
     for r in range(src_row_start, src_row_end + 1):
-        if r in src_ws.row_dimensions and src_ws.row_dimensions[r].height is not None:
-            dst_ws.row_dimensions[r + row_delta].height = src_ws.row_dimensions[r].height
+        height = src_ws.row_dimensions.get(r)
+        if height is not None and height.height is not None:
+            dst_ws.row_dimensions[r + offset].height = height.height
 
         for c in range(1, max_col + 1):
-            src_cell = src_ws.cell(r, c)
-            dst_cell = dst_ws.cell(r + row_delta, c)
+            src = src_ws.cell(r, c)
+            dst = dst_ws.cell(r + offset, c)
+            style_id = src.style_id
+            if style_id not in style_map:
+                _copy_style_between_workbooks(src, dst)
+                style_map[style_id] = copy(dst._style)
+            dst._style = copy(style_map[style_id])
+            value = src.value
+            if src_ws_vals is not None or src.data_type == "f":
+                cached = (_safe_value(src_ws_vals, r, c) if src_ws_vals is not None
+                          else (formula_values or {}).get((r, c)))
+                if cached is not None or (isinstance(value, str) and value.startswith("=")):
+                    value = cached
+            dst.value = value
 
-            # style
-            if src_cell.has_style:
-                dst_cell._style = copy(src_cell._style)
-            dst_cell.number_format = src_cell.number_format
-            dst_cell.protection = copy(src_cell.protection)
-            dst_cell.alignment = copy(src_cell.alignment)
-            dst_cell.font = copy(src_cell.font)
-            dst_cell.border = copy(src_cell.border)
-            dst_cell.fill = copy(src_cell.fill)
-
-            # value (not formula)
-            val = _safe_value(src_ws_vals, r, c)
-            if val is None:
-                val = src_cell.value
-                if isinstance(val, str) and val.startswith("="):
-                    val = None
-            dst_cell.value = val
-
-    # merges fully inside copied block
-    for mr in list(src_ws.merged_cells.ranges):
-        min_r, min_c, max_r, max_c = mr.min_row, mr.min_col, mr.max_row, mr.max_col
-        if min_r >= src_row_start and max_r <= src_row_end and max_c <= max_col:
-            dst_ws.merge_cells(
-                start_row=min_r + row_delta,
-                start_column=min_c,
-                end_row=max_r + row_delta,
-                end_column=max_c,
-            )
+    for merged in src_ws.merged_cells.ranges:
+        if src_row_start <= merged.min_row and merged.max_row <= src_row_end and merged.max_col <= max_col:
+            dst_ws.merge_cells(start_row=merged.min_row + offset, end_row=merged.max_row + offset,
+                               start_column=merged.min_col, end_column=merged.max_col)
 
 
 def _merge_anchor(ws, r, c):
@@ -265,177 +298,79 @@ def _freeze_formulas_to_values(ws, ws_vals):
 
 
 def _insert_wfp_column_a(ws, ws_vals, data_start, data_end):
-    ws.insert_cols(1)
-    ws_vals.insert_cols(1)
-
-    style_source = ws.cell(data_start, 2)  # B
-    for r in range(data_start, data_end + 1):
-        has_data = False
-        for c in range(2, ws.max_column + 1):
-            if ws.cell(r, c).value not in (None, ""):
-                has_data = True
-                break
-        if not has_data:
-            continue
-
-        a_cell = ws.cell(r, 1)
-        a_cell.value = "WFP"
-
-        if style_source is not None and style_source.has_style:
-            a_cell._style = copy(style_source._style)
-            a_cell.number_format = style_source.number_format
-            a_cell.protection = copy(style_source.protection)
-            a_cell.alignment = copy(style_source.alignment)
-            a_cell.font = copy(style_source.font)
-            a_cell.border = copy(style_source.border)
-            a_cell.fill = copy(style_source.fill)
+    rows_with_data = {cell.row for cell in ws._cells.values()
+                      if data_start <= cell.row <= data_end and cell.value not in (None, "")}
+    # A formatted cell far below the data should not turn a sparse sheet into
+    # a full rectangle. Move existing cells right, from the last column back.
+    for sheet in (ws, ws_vals):
+        if sheet is not None:
+            for row, col in sorted(sheet._cells, key=lambda pos: pos[1], reverse=True):
+                sheet._move_cell(row, col, row_offset=0, col_offset=1)
+    style = ws.cell(data_start, 2)._style
+    for r in rows_with_data:
+        cell = ws.cell(r, 1)
+        cell.value = "WFP"
+        cell._style = copy(style)
 
 
 def _row_has_data_for_merge(ws, r, max_col):
-    for c in range(2, max_col + 1):
-        if ws.cell(r, c).value not in (None, ""):
-            return True
-    return False
+    return any(ws.cell(r, c).value not in (None, "") for c in range(2, max_col + 1))
+
+
+def _merge_column_group(ws, col, first, last):
+    if first < last:
+        anchor = ws.cell(first, col)
+        style = copy(anchor._style)
+        ws.merge_cells(start_row=first, end_row=last, start_column=col, end_column=col)
+        anchor._style = style
 
 
 def _merge_wfp_blocks_in_master(master_ws, max_col):
-    max_row = master_ws.max_row
-
-    # unmerge anything intersecting col A in data area
-    to_unmerge = []
-    for mr in list(master_ws.merged_cells.ranges):
-        min_c, min_r, max_c, max_r = range_boundaries(str(mr))
-        if min_c <= 1 <= max_c and max_r >= DATA_START_ROW:
-            to_unmerge.append(str(mr))
-    for rng in to_unmerge:
-        master_ws.unmerge_cells(rng)
-
-    r = DATA_START_ROW
-    while r <= max_row:
-        if master_ws.cell(r, 1).value == "WFP" and _row_has_data_for_merge(master_ws, r, max_col):
-            start = r
-            end = r
-            r += 1
-            while (
-                r <= max_row
-                and master_ws.cell(r, 1).value == "WFP"
-                and _row_has_data_for_merge(master_ws, r, max_col)
-            ):
-                end = r
-                r += 1
-
-            if end > start:
-                top = master_ws.cell(start, 1)
-                top_style = copy(top._style)
-                top_font = copy(top.font)
-                top_alignment = copy(top.alignment)
-                top_border = copy(top.border)
-                top_fill = copy(top.fill)
-                top_number_format = top.number_format
-                top_protection = copy(top.protection)
-
-                master_ws.merge_cells(start_row=start, start_column=1, end_row=end, end_column=1)
-
-                top = master_ws.cell(start, 1)
-                top.value = "WFP"
-                top._style = top_style
-                top.font = top_font
-                top.alignment = top_alignment
-                top.border = top_border
-                top.fill = top_fill
-                top.number_format = top_number_format
-                top.protection = top_protection
-        else:
-            r += 1
+    _clear_merges_on_cols(master_ws, cols=(1,), from_row=DATA_START_ROW)
+    last = master_ws.max_row
+    first = None
+    for r in range(DATA_START_ROW, last + 2):
+        is_wfp = (r <= last and master_ws.cell(r, 1).value == "WFP"
+                  and _row_has_data_for_merge(master_ws, r, max_col))
+        if is_wfp and first is None:
+            first = r
+        elif not is_wfp and first is not None:
+            _merge_column_group(master_ws, 1, first, r - 1)
+            first = None
 
 
 def _clear_merges_on_cols(ws, cols=(1, 2), from_row=DATA_START_ROW):
-    to_unmerge = []
-
-    for mr in list(ws.merged_cells.ranges):
-        min_c, min_r, max_c, max_r = range_boundaries(str(mr))
-
-        if max_r < from_row:
-            continue
-
-        intersects_cols = any(min_c <= col <= max_c for col in cols)
-        if intersects_cols:
-            to_unmerge.append(str(mr))
-
-    for rng in to_unmerge:
-        ws.unmerge_cells(rng)
+    for merged in list(ws.merged_cells.ranges):
+        if merged.max_row >= from_row and any(merged.min_col <= c <= merged.max_col for c in cols):
+            ws.unmerge_cells(str(merged))
 
 
 def _merge_down_by_blanks(ws, col, max_col, from_row=DATA_START_ROW):
-    """
-    Merge downwards starting at a value cell, until next value appears,
-    as long as the row is a real data row.
-    """
-    r = from_row
-    while r <= ws.max_row:
-        v = ws.cell(r, col).value
-        if v in (None, "") or not _row_has_data_row(ws, r, max_col):
-            r += 1
-            continue
-
-        start = r
-        end = r
-        rr = r + 1
-
-        while rr <= ws.max_row:
-            if not _row_has_data_row(ws, rr, max_col):
-                break
-
-            next_val = ws.cell(rr, col).value
-            if next_val not in (None, ""):
-                break
-
-            end = rr
-            rr += 1
-
-        if end > start:
-            top = ws.cell(start, col)
-            top_style = copy(top._style)
-            top_font = copy(top.font)
-            top_alignment = copy(top.alignment)
-            top_border = copy(top.border)
-            top_fill = copy(top.fill)
-            top_number_format = top.number_format
-            top_protection = copy(top.protection)
-
-            ws.merge_cells(start_row=start, start_column=col, end_row=end, end_column=col)
-
-            top = ws.cell(start, col)
-            top.value = v
-            top._style = top_style
-            top.font = top_font
-            top.alignment = top_alignment
-            top.border = top_border
-            top.fill = top_fill
-            top.number_format = top_number_format
-            top.protection = top_protection
-
-        r = end + 1
+    """A value starts a group. Empty data rows and the next value end it."""
+    first = None
+    last = ws.max_row
+    for r in range(from_row, last + 2):
+        has_data = r <= last and _row_has_data_row(ws, r, max_col)
+        has_label = has_data and ws.cell(r, col).value not in (None, "")
+        if first is not None and (has_label or not has_data):
+            _merge_column_group(ws, col, first, r - 1)
+            first = None
+        if has_label:
+            first = r
 
 
 def _clear_merges_intersecting_cols(ws, col_start, col_end):
-    to_unmerge = []
-
-    for mr in list(ws.merged_cells.ranges):
-        min_c, min_r, max_c, max_r = range_boundaries(str(mr))
-
-        if not (max_c < col_start or min_c > col_end):
-            to_unmerge.append(str(mr))
-
-    for rng in to_unmerge:
-        ws.unmerge_cells(rng)
+    for merged in list(ws.merged_cells.ranges):
+        if merged.min_col <= col_end and merged.max_col >= col_start:
+            ws.unmerge_cells(str(merged))
 
 
 def _delete_cols_safe(ws, col_start, col_end):
     _clear_merges_intersecting_cols(ws, col_start, col_end)
-    for col in range(col_end, col_start - 1, -1):
-        if col <= ws.max_column:
-            ws.delete_cols(col, 1)
+    count = min(ws.max_column, col_end) - col_start + 1
+    if count > 0:
+        ws.delete_cols(col_start, count)
+
 
 def _ensure_real_cell(ws, row, col):
     """
@@ -450,274 +385,175 @@ def _ensure_real_cell(ws, row, col):
 
     return cell
 
-def build_combined_workbook_bytes(uploads, status=None):
-    """
-    Combine uploaded UNOPS/WFP workbooks while keeping only one source
-    workbook pair in memory at a time.
 
-    This replaces the old implementation that kept two full openpyxl
-    workbooks for every upload until the whole combine step was finished.
-    """
+def _read_distribution_tasks(uploads, status):
     tasks = []
-
-    # First pass: keep only raw bytes + small metadata. Close each workbook
-    # immediately so memory does not grow with every uploaded file.
-    for up in uploads:
-        data = up.getvalue()
-
+    for upload in uploads:
         try:
-            wb_meta = load_workbook(BytesIO(data), data_only=False)
-        except Exception as e:
-            if status:
-                status.warning(
-                    f"Skipped '{up.name}': could not read as .xlsx ({e})"
-                )
-            continue
-
-        try:
-            kind, sheetname = _find_target_sheet(wb_meta)
-            if kind is None:
-                if status:
-                    status.warning(
-                        f"Skipped '{up.name}': no matching Total Distribution "
-                        f"sheet found. Sheets: {wb_meta.sheetnames}"
-                    )
-                continue
-
-            ws_meta = wb_meta[sheetname]
-            start_row = _first_data_row(ws_meta, DATA_START_ROW)
-            end_row = _last_data_row(
-                ws_meta,
-                start_row,
-                ws_meta.max_column,
-            )
-
-            tasks.append({
-                "name": up.name,
-                "kind": kind,
-                "sheet": sheetname,
-                "data": data,
-                "start_row": start_row,
-                "end_row": end_row,
-                # WFP receives one inserted column A later.
-                "effective_max_col": (
-                    ws_meta.max_column + 1
-                    if kind == "WFP"
-                    else ws_meta.max_column
-                ),
-            })
-        finally:
-            wb_meta.close()
-
+            with closing(load_workbook(BytesIO(upload.getvalue()), read_only=True, keep_links=False)) as metadata:
+                kind, sheet = _find_target_sheet(metadata)
+                if kind:
+                    tasks.append((kind, sheet, upload))
+                elif status is not None:
+                    status.warning(f"Skipped '{upload.name}': no matching Total Distribution sheet found. "
+                                   f"Sheets: {metadata.sheetnames}")
+        except Exception as exc:
+            if status is not None:
+                status.warning(f"Skipped '{upload.name}': could not read as .xlsx ({exc})")
     if not tasks:
         raise RuntimeError("No valid files found.")
+    # Sorting is stable, so uploads from the same organisation keep their order.
+    return sorted(tasks, key=lambda item: item[0] != "UNOPS")
 
-    # UNOPS first, then WFP.
-    tasks.sort(key=lambda x: 0 if x["kind"] == "UNOPS" else 1)
-    master_max_col = max(t["effective_max_col"] for t in tasks)
 
-    master_wb = Workbook()
-    master_ws = master_wb.active
-    master_ws.title = "Distribution Summary"
+def _cached_formula_values(data, ws, last_row, column_offset=0):
+    """Stream just the selected sheet's cached formula results when it contains formulas."""
+    columns_by_row = {}
+    for cell in ws._cells.values():
+        if cell.data_type == "f" and cell.row <= last_row:
+            columns_by_row.setdefault(cell.row, []).append(cell.column)
+    if not columns_by_row:
+        return {}
 
-    wrote_header = False
-    next_write_row = DATA_START_ROW
+    first = min(columns_by_row)
+    width = max(max(cols) for cols in columns_by_row.values())
+    result = {}
+    with closing(load_workbook(BytesIO(data), read_only=True, data_only=True, keep_links=False)) as values_book:
+        rows = values_book[ws.title].iter_rows(min_row=first, max_row=max(columns_by_row),
+                                               max_col=width, values_only=True)
+        for r, values in enumerate(rows, first):
+            for col in columns_by_row.get(r, ()):
+                result[r, col + column_offset] = values[col - 1]
+    return result
 
-    # Second pass: open, copy, and close one source file at a time.
-    for t in tasks:
-        wb = None
-        wb_vals = None
 
+def build_combined_workbook(uploads, status=None):
+    """Build the master in memory, processing one distribution workbook at a time."""
+    tasks = _read_distribution_tasks(uploads, status)
+    master = Workbook()
+    sheet = master.active
+    sheet.title = DISTRIBUTION_SHEET_NAME
+    next_row = DATA_START_ROW
+    widest = 0
+    padding = []
+    header_widths = {}
+
+    readable_source = False
+    for kind, sheet_name, upload in tasks:
+        data = upload.getvalue()
         try:
-            wb = load_workbook(
-                BytesIO(t["data"]),
-                data_only=False,
-            )
-            wb_vals = load_workbook(
-                BytesIO(t["data"]),
-                data_only=True,
-            )
-
-            ws = wb[t["sheet"]]
-            ws_vals = wb_vals[t["sheet"]]
-
-            start_row = t["start_row"]
-            end_row = t["end_row"]
-
-            if end_row < start_row:
-                if status:
-                    status.warning(
-                        f"⚠️ {t['kind']} | {t['name']} has no data rows."
-                    )
+            source_book = load_workbook(BytesIO(data), keep_links=False)
+        except Exception as exc:
+            if status is not None:
+                status.warning(f"Skipped '{upload.name}': could not read as .xlsx ({exc})")
+            continue
+        with closing(source_book) as source:
+            readable_source = True
+            ws = source[sheet_name]
+            offset = int(kind == "WFP")
+            width = ws.max_column + offset
+            widest = max(widest, width)
+            first = _first_data_row(ws)
+            footer = _last_data_row(ws, first, width)
+            if footer <= first:
+                reason = "has no data rows" if footer < first else "became empty after removing last text row"
+                if status is not None:
+                    status.warning(f"⚠️ {kind} | {upload.name} {reason}.")
                 continue
 
-            if t["kind"] == "WFP":
-                _insert_wfp_column_a(
-                    ws,
-                    ws_vals,
-                    start_row,
-                    end_row,
-                )
+            # The last populated row is the source footer. Exclude it from the copy.
+            last = footer - 1
+            cached = _cached_formula_values(data, ws, last, offset)
+            if kind == "WFP":
+                _insert_wfp_column_a(ws, None, first, footer)
 
-            end_row = _last_data_row(
-                ws,
-                start_row,
-                ws.max_column,
-            )
+            style_map = {}
+            block_start = next_row
+            if next_row == DATA_START_ROW:
+                header_widths = {key: dim.width for key, dim in ws.column_dimensions.items()}
+                _copy_dimensions(ws, sheet, width, HEADER_ROWS)
+                _copy_block_values_only(ws, None, sheet, 1, HEADER_ROWS, 1, width, style_map, cached)
+                block_start = 1
+            _copy_block_values_only(ws, None, sheet, first, last, next_row, width, style_map, cached)
+            next_row += last - first + 1
 
-            if end_row < start_row:
-                if status:
-                    status.warning(
-                        f"⚠️ {t['kind']} | {t['name']} has no data rows "
-                        "after WFP insert."
-                    )
-                continue
+            # A narrower input may have a custom default style even in its empty columns.
+            if 0 not in style_map:
+                blank = Cell(ws)
+                template = Cell(sheet)
+                _copy_style_between_workbooks(blank, template)
+                style_map[0] = template._style
+            padding.append((block_start, next_row - 1, width, style_map[0]))
 
-            end_row = _delete_last_text_row_in_sheet(
-                ws,
-                start_row,
-                end_row,
-                ws.max_column,
-            )
+    if not readable_source:
+        raise RuntimeError("No valid files found.")
+    if next_row > DATA_START_ROW:
+        sheet.cell(1, widest)
+        for start, end, width, style in padding:
+            if width < widest and style and any(style):
+                for row in sheet.iter_rows(min_row=start, max_row=end, min_col=width + 1, max_col=widest):
+                    for cell in row:
+                        cell._style = copy(style)
+        for c in range(1, widest + 1):
+            letter = get_column_letter(c)
+            if header_widths.get(letter) is not None:
+                sheet.column_dimensions[letter].width = header_widths[letter]
 
-            if end_row < start_row:
-                if status:
-                    status.warning(
-                        f"⚠️ {t['kind']} | {t['name']} became empty "
-                        "after removing last text row."
-                    )
-                continue
-
-            _freeze_formulas_to_values(ws, ws_vals)
-
-            if not wrote_header:
-                _copy_dimensions(
-                    ws,
-                    master_ws,
-                    max_col=master_max_col,
-                    header_rows=HEADER_ROWS,
-                )
-                _copy_block_values_only(
-                    ws,
-                    ws_vals,
-                    master_ws,
-                    1,
-                    HEADER_ROWS,
-                    1,
-                    max_col=master_max_col,
-                )
-                wrote_header = True
-
-            _copy_block_values_only(
-                ws,
-                ws_vals,
-                master_ws,
-                start_row,
-                end_row,
-                next_write_row,
-                max_col=master_max_col,
-            )
-            next_write_row += end_row - start_row + 1
-
-        finally:
-            if wb is not None:
-                wb.close()
-            if wb_vals is not None:
-                wb_vals.close()
-
-            # Drop the raw bytes after this task has been copied.
-            t["data"] = None
-            gc.collect()
-
-    _merge_wfp_blocks_in_master(
-        master_ws,
-        max_col=master_ws.max_column,
-    )
-
-    _clear_merges_on_cols(
-        master_ws,
-        cols=(1, 2),
-        from_row=DATA_START_ROW,
-    )
-    _merge_down_by_blanks(
-        master_ws,
-        col=1,
-        max_col=master_ws.max_column,
-        from_row=DATA_START_ROW,
-    )
-    _merge_down_by_blanks(
-        master_ws,
-        col=2,
-        max_col=master_ws.max_column,
-        from_row=DATA_START_ROW,
-    )
-
-    for c in range(1, master_ws.max_column + 1):
-        master_ws.column_dimensions[
-            get_column_letter(c)
-        ].hidden = False
-
-    for r in range(1, master_ws.max_row + 1):
-        master_ws.row_dimensions[r].hidden = False
-
-    master_ws.auto_filter.ref = None
-
+    width = sheet.max_column
+    _merge_wfp_blocks_in_master(sheet, width)
+    _clear_merges_on_cols(sheet)
+    for col in (1, 2):
+        _merge_down_by_blanks(sheet, col, width)
+    for c in range(1, width + 1):
+        sheet.column_dimensions[get_column_letter(c)].hidden = False
+    for r in range(1, sheet.max_row + 1):
+        sheet.row_dimensions[r].hidden = False
     if DELETE_COMBINED_COLS_F_TO_I_BEFORE_CALC:
-        _delete_cols_safe(master_ws, 6, 9)
-
-    out = BytesIO()
-    master_wb.save(out)
-    master_wb.close()
-    out.seek(0)
-
-    tasks.clear()
-    gc.collect()
-
-    return out
+        _delete_cols_safe(sheet, 6, 9)
+    return master
 
 
-# ============================================================
-# CALCULATIONS HELPERS (your cleaner logic, wrapped into a function)
-# ============================================================
+def build_combined_workbook_bytes(uploads, status=None):
+    with closing(build_combined_workbook(uploads, status)) as workbook:
+        return workbook_bytes(workbook)
+
+
+# Distribution calculations
+
+
+def _copy_formatting(source, existing):
+    # Named-style, quote-prefix and pivot flags belong to the destination cell.
+    style = copy(source) if source is not None else StyleArray()
+    style.xfId = existing.xfId if existing else 0
+    style.quotePrefix = existing.quotePrefix if existing else 0
+    style.pivotButton = existing.pivotButton if existing else 0
+    return style
+
+
 def copy_cell_style(src, dst):
-    dst.font = copy(src.font)
-    dst.fill = copy(src.fill)
-    dst.border = copy(src.border)
-    dst.alignment = copy(src.alignment)
-    dst.number_format = src.number_format
-    dst.protection = copy(src.protection)
+    """Copy the six formatting components without sharing a mutable style array."""
+    if src is None or dst is None:
+        return
+    if src.parent.parent is not dst.parent.parent:
+        # The public helper also accepts cells from two independent workbooks.
+        for attr in ("font", "fill", "border", "alignment", "number_format", "protection"):
+            setattr(dst, attr, copy(getattr(src, attr)))
+        return
+    dst._style = _copy_formatting(src._style, dst._style)
 
 
 def unmerge_and_fill(ws, col_min: int, col_max: int):
-    merges = []
-    for mr in ws.merged_cells.ranges:
-        if not (mr.max_col < col_min or mr.min_col > col_max):
-            merges.append(mr)
-
-    for mr in merges:
-        tl = ws.cell(row=mr.min_row, column=mr.min_col)
-        value = tl.value
-        style = {
-            "font": copy(tl.font),
-            "fill": copy(tl.fill),
-            "border": copy(tl.border),
-            "alignment": copy(tl.alignment),
-            "number_format": tl.number_format,
-            "protection": copy(tl.protection),
-        }
-
-        ws.unmerge_cells(str(mr))
-
-        for r in range(mr.min_row, mr.max_row + 1):
-            for c in range(mr.min_col, mr.max_col + 1):
-                cell = ws.cell(row=r, column=c)
+    for merged in list(ws.merged_cells.ranges):
+        if merged.max_col < col_min or merged.min_col > col_max:
+            continue
+        anchor = ws.cell(merged.min_row, merged.min_col)
+        value = anchor.value
+        ws.unmerge_cells(str(merged))
+        for row in ws.iter_rows(min_row=merged.min_row, max_row=merged.max_row,
+                                min_col=merged.min_col, max_col=merged.max_col):
+            for cell in row:
                 cell.value = value
-                cell.font = copy(style["font"])
-                cell.fill = copy(style["fill"])
-                cell.border = copy(style["border"])
-                cell.alignment = copy(style["alignment"])
-                cell.number_format = style["number_format"]
-                cell.protection = copy(style["protection"])
+                copy_cell_style(anchor, cell)
 
 
 def snapshot_row(ws, r):
@@ -750,16 +586,15 @@ def restore_row(ws, r, row_data):
         cell.protection = d["protection"]
 
 
-def safe_float(v):
-    if v is None:
+def safe_float(value):
+    if value is None:
         return 0.0
-    if isinstance(v, (int, float)):
-        return float(v)
-    if isinstance(v, str):
-        s = v.strip()
-        if s == "":
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        s = value.strip().replace(",", "")
+        if not s:
             return 0.0
-        s = s.replace(",", "")
         try:
             return float(s)
         except Exception:
@@ -774,6 +609,7 @@ def norm_header(x):
 def rgb_fill(r, g, b):
     return PatternFill(fill_type="solid", fgColor=f"FF{r:02X}{g:02X}{b:02X}")
 
+
 def style_headers_black_only_with_text(ws, header_row=1):
     header_fill = PatternFill(fill_type="solid", fgColor="000000")  # black
     header_font = Font(color="FFFFFF", bold=True)                  # white
@@ -785,6 +621,7 @@ def style_headers_black_only_with_text(ws, header_row=1):
         if cell.value is not None and str(cell.value).strip() != "":
             cell.fill = header_fill
             cell.font = header_font
+
 
 def _font_without_bold(f: Font) -> Font:
     if f is None:
@@ -809,20 +646,15 @@ def _font_without_bold(f: Font) -> Font:
 
 
 def remove_bold_except_header(ws, header_row=1):
-    """
-    Remove bold from all cells except header row.
-    Keeps other font properties intact.
-    """
-    max_r = ws.max_row
-    max_c = ws.max_column
-    for r in range(1, max_r + 1):
-        if r == header_row:
-            continue
-        for c in range(1, max_c + 1):
-            cell = ws.cell(row=r, column=c)
-            f = cell.font
-            if f is not None and f.bold:
-                cell.font = _font_without_bold(f)
+    plain_fonts = {}
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.row == header_row or not cell.font.bold:
+                continue
+            font_id = cell._style.fontId
+            if font_id not in plain_fonts:
+                plain_fonts[font_id] = _font_without_bold(cell.font)
+            cell.font = plain_fonts[font_id]
 
 
 def _find_header_col_by_names(ws, header_row, header_names):
@@ -946,726 +778,286 @@ def normalise_distribution_description_usage_markers(ws, header_row=1):
             if cluster_norm != "WFP" and _is_regular_cluster_for_internal_use(cluster_value):
                 cluster_cell.value = "LOGISTICS"
 
-def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, status=None) -> BytesIO:
-    """
-    Takes the combined workbook bytes (with sheet 'Master'),
-    runs your calculations pipeline on it,
-    returns final output BytesIO.
-    """
-    combined_bytes.seek(0)
-    wb = load_workbook(combined_bytes, data_only=False)
 
-    # The combiner already copied cached values instead of formulas, so loading
-    # a second full data_only workbook here only doubled memory for no benefit.
-    TARGET_SHEET = "Distribution Summary"
-    sheet_map = {name.strip(): name for name in wb.sheetnames}
+def _delete_rows_together(ws, removed):
+    """Compact the surviving runs once, then delete the unused tail."""
+    if not removed:
+        return
+    removed = sorted(set(removed))
+    last = ws.max_row
+    right = get_column_letter(ws.max_column)
+    start = removed[0] + 1
+    for count, stop in enumerate([*removed[1:], last + 1], 1):
+        if start < stop:
+            ws.move_range(f"A{start}:{right}{stop - 1}", rows=-count)
+        start = stop + 1
+    ws.delete_rows(last - len(removed) + 1, len(removed))
 
-    if TARGET_SHEET not in sheet_map:
-        raise RuntimeError(
-            f'Sheet "{TARGET_SHEET}" not found. '
-            f"Sheets found: {list(sheet_map.keys())}"
-        )
 
-    keep_name = sheet_map[TARGET_SHEET]
+def _copy_width(ws, source, target):
+    dim = ws.column_dimensions.get(source)
+    if dim is not None and dim.width is not None:
+        ws.column_dimensions[target].width = dim.width
 
-    for name in list(wb.sheetnames):
-        if name != keep_name:
-            wb.remove(wb[name])
 
-    ws = wb[keep_name]
-    ws.title = TARGET_SHEET
+def _add_fuel_columns(ws):
+    """Combine diesel and petrol, then sum the surviving rows by description key."""
+    unmerge_and_fill(ws, 4, 6)
+    ws["F1"] = "Fuel sum"
+    copy_cell_style(ws["D1"], ws["F1"])
+    _copy_width(ws, "E" if "E" in ws.column_dimensions else "D", "F")
 
-    if progress:
-        progress.progress(10)
-    if status:
-        status.info("Unmerging A–C…")
-
-    # Unmerge A–C
-    unmerge_and_fill(ws, col_min=1, col_max=3)
-
-    if progress:
-        progress.progress(18)
-    if status:
-        status.info("Preparing combined values…")
-
-    # No second workbook scan is needed: build_combined_workbook_bytes()
-    # already writes cached values only.
-    if progress:
-        progress.progress(26)
-
-    # Delete row 2
-    ws.delete_rows(2)
-
-    # Delete rows containing 'TOTAL' in A,B,C (kept from your original)
-    if status:
-        status.info("Removing TOTAL rows…")
-
-    rows_to_delete = []
-    for row in range(1, ws.max_row + 1):
-        for col in (1, 2, 3):
-            val = ws.cell(row=row, column=col).value
-            if val is not None and "TOTAL" in str(val).upper():
-                rows_to_delete.append(row)
-                break
-    for rr in sorted(set(rows_to_delete), reverse=True):
-        ws.delete_rows(rr)
-
-    if progress:
-        progress.progress(34)
-
-    header_row = 1
-
-    # Normalise new UNOPS Description prefixes before the existing calculation logic runs.
-    normalise_distribution_description_usage_markers(ws, header_row=header_row)
-
-    # Unmerge D–F before Fuel Sum
-    unmerge_and_fill(ws, col_min=4, col_max=6)  # D..F
-
-    # Add Fuel sum in F (values)
-    if status:
-        status.info("Building Fuel sum…")
-
-    col_d, col_e, col_f = 4, 5, 6  # D,E,F
-
-    ref_header = ws.cell(row=header_row, column=col_d)
-    fuel_header = ws.cell(row=header_row, column=col_f)
-
-    fuel_header.value = "Fuel sum"
-    fuel_header.font = copy(ref_header.font)
-    fuel_header.fill = copy(ref_header.fill)
-    fuel_header.border = copy(ref_header.border)
-    fuel_header.alignment = copy(ref_header.alignment)
-    fuel_header.number_format = ref_header.number_format
-    fuel_header.protection = copy(ref_header.protection)
-
-    if "E" in ws.column_dimensions and ws.column_dimensions["E"].width is not None:
-        ws.column_dimensions["F"].width = ws.column_dimensions["E"].width
-    elif "D" in ws.column_dimensions and ws.column_dimensions["D"].width is not None:
-        ws.column_dimensions["F"].width = ws.column_dimensions["D"].width
-
-    for r in range(header_row + 1, ws.max_row + 1):
-        d_cell = ws.cell(row=r, column=col_d)
-        e_cell = ws.cell(row=r, column=col_e)
-        f_cell = ws.cell(row=r, column=col_f)
-
-        d_val = d_cell.value
-        e_val = e_cell.value
-
-        if d_val is None and e_val is None:
-            f_cell.value = None
-        else:
-            try:
-                d_num = 0.0 if d_val is None else float(d_val)
-                e_num = 0.0 if e_val is None else float(e_val)
-                f_cell.value = d_num + e_num
-            except Exception:
-                f_cell.value = None
-
-        style_src = d_cell if d_cell.value is not None else e_cell
-        f_cell.font = copy(style_src.font)
-        f_cell.fill = copy(style_src.fill)
-        f_cell.border = copy(style_src.border)
-        f_cell.alignment = copy(style_src.alignment)
-        f_cell.number_format = style_src.number_format
-        f_cell.protection = copy(style_src.protection)
-
-    if progress:
-        progress.progress(45)
-
-    # Delete rows where Fuel sum is 0 or empty
-    if status:
-        status.info("Removing empty/zero fuel rows…")
-
-    rows_remove = []
-    for r in range(header_row + 1, ws.max_row + 1):
-        val = ws.cell(row=r, column=col_f).value
-        if val is None or (isinstance(val, str) and val.strip() == ""):
-            rows_remove.append(r)
-            continue
+    empty_rows = []
+    for diesel, petrol, fuel in ws.iter_rows(min_row=2, min_col=4, max_col=6):
         try:
-            if float(val) == 0.0:
-                rows_remove.append(r)
-        except Exception:
-            pass
-    for rr in sorted(set(rows_remove), reverse=True):
-        ws.delete_rows(rr)
+            litres = (0.0 if diesel.value is None else float(diesel.value))
+            litres += 0.0 if petrol.value is None else float(petrol.value)
+        except (ValueError, TypeError, OverflowError):
+            litres = 0.0
+        if litres == 0:
+            empty_rows.append(fuel.row)
+        else:
+            fuel.value = litres
+            copy_cell_style(diesel if diesel.value is not None else petrol, fuel)
+    _delete_rows_together(ws, empty_rows)
 
-    if progress:
-        progress.progress(52)
-
-    # Delete columns D and E
-    ws.delete_cols(5)  # E
-    ws.delete_cols(4)  # D
-    # Fuel sum moved to D.
-
-    if progress:
-        progress.progress(56)
-
-    # Insert Description Sum as column E
-    if status:
-        status.info("Building Description Sum…")
-
-    desc_col = 5  # E
-    ws.insert_cols(desc_col)
-
-    ref_h = ws.cell(row=header_row, column=1)
-    desc_h = ws.cell(row=header_row, column=desc_col)
-
-    desc_h.value = "Description Sum"
-    desc_h.font = copy(ref_h.font)
-    desc_h.fill = copy(ref_h.fill)
-    desc_h.border = copy(ref_h.border)
-    desc_h.alignment = copy(ref_h.alignment)
-    desc_h.number_format = ref_h.number_format
-    desc_h.protection = copy(ref_h.protection)
-
-    if "C" in ws.column_dimensions and ws.column_dimensions["C"].width is not None:
-        ws.column_dimensions[get_column_letter(desc_col)].width = ws.column_dimensions["C"].width
-
-    for r in range(header_row + 1, ws.max_row + 1):
-        a = ws.cell(row=r, column=1).value
-        b = ws.cell(row=r, column=2).value
-        c = ws.cell(row=r, column=3).value
-
-        a_s = "" if a is None else str(a)
-        b_s = "" if b is None else str(b)
-        c_s = "" if c is None else str(c)
-
-        cell = ws.cell(row=r, column=desc_col)
-        cell.value = f"{a_s},{b_s},{c_s}"
-
-        src = ws.cell(row=r, column=1)
-        cell.font = copy(src.font)
-        cell.fill = copy(src.fill)
-        cell.border = copy(src.border)
-        cell.alignment = copy(src.alignment)
-        cell.number_format = src.number_format
-        cell.protection = copy(src.protection)
-
-    if progress:
-        progress.progress(64)
-
-    # Unified Fuel as values
-    if status:
-        status.info("Building Unified Fuel…")
-
-    unified_col = 6  # F
-    ws.insert_cols(unified_col)
-
-    ref_unified_header = ws.cell(row=header_row, column=4)  # D header
-    unified_header = ws.cell(row=header_row, column=unified_col)
-    unified_header.value = "Unified Fuel"
-    unified_header.font = copy(ref_unified_header.font)
-    unified_header.fill = copy(ref_unified_header.fill)
-    unified_header.border = copy(ref_unified_header.border)
-    unified_header.alignment = copy(ref_unified_header.alignment)
-    unified_header.number_format = ref_unified_header.number_format
-    unified_header.protection = copy(ref_unified_header.protection)
-
-    d_letter = get_column_letter(4)
-    f_letter = get_column_letter(unified_col)
-    if d_letter in ws.column_dimensions and ws.column_dimensions[d_letter].width is not None:
-        ws.column_dimensions[f_letter].width = ws.column_dimensions[d_letter].width
+    ws.delete_cols(4, 2)
+    ws.insert_cols(5, 2)
+    ws["E1"] = "Description Sum"
+    ws["F1"] = "Unified Fuel"
+    copy_cell_style(ws["A1"], ws["E1"])
+    copy_cell_style(ws["D1"], ws["F1"])
+    _copy_width(ws, "C", "E")
+    _copy_width(ws, "D", "F")
 
     totals = {}
-    for r in range(header_row + 1, ws.max_row + 1):
-        key = ws.cell(row=r, column=5).value  # E
-        fuel = safe_float(ws.cell(row=r, column=4).value)  # D
-        totals[key] = totals.get(key, 0.0) + fuel
-
-    for r in range(header_row + 1, ws.max_row + 1):
-        target = ws.cell(row=r, column=unified_col)  # F
-        style_src = ws.cell(row=r, column=4)         # D
-        key = ws.cell(row=r, column=5).value         # E
-
-        target.value = totals.get(key, 0.0)
-        target.font = copy(style_src.font)
-        target.fill = copy(style_src.fill)
-        target.border = copy(style_src.border)
-        target.alignment = copy(style_src.alignment)
-        target.number_format = style_src.number_format
-        target.protection = copy(style_src.protection)
-
-    if progress:
-        progress.progress(72)
-
-    # Sorting
-    if status:
-        status.info("Sorting…")
-
-    # Find INTERVENTION + AGENCY columns
-    intervention_col = None
-    agency_col = None
-
-    for c in range(1, ws.max_column + 1):
-        h = ws.cell(row=1, column=c).value
-        nh = norm_header(h)
-        if nh == "INTERVENTION":
-            intervention_col = c
-        elif nh == "AGENCY":
-            agency_col = c
-
-    if intervention_col is None:
-        intervention_col = 1
-
-    if agency_col is None:
-        raise RuntimeError('Header "AGENCY" not found.')
-
-    # Normalise OHCHR rows to LOGISTICS so they later become UN Agencies,
-    # even when the source file places OHCHR under an irregular cluster such as Protection.
-    for r in range(2, ws.max_row + 1):
-        iv = ws.cell(row=r, column=intervention_col).value
-        agency = ws.cell(row=r, column=agency_col).value
-        if _contains_ohchr(iv) or _contains_ohchr(agency):
-            ws.cell(row=r, column=intervention_col).value = "LOGISTICS"
-
-    REGULAR_INTERVENTIONS = {
-        "ETC",
-        "HEALTH",
-        "WASH",
-        "INGOS",
-        "UN-OHCHR",
-        "WFP",
-        "UN AGENCIES",
-        "LOGISTICS",   # IMPORTANT: exclude from prefix+convert logic
-    }
-
-    def _clean_str(v):
-        return "" if v is None else str(v).strip()
-
-    converted_desc_keys = set()  # <-- stable IDs for converted rows
-    rows_data = []
-    max_r = ws.max_row  # cache for speed
-
-    for r in range(2, max_r + 1):
-        iv_raw = _clean_str(ws.cell(row=r, column=intervention_col).value)
-        iv_up = iv_raw.upper()
-
-        is_converted = False
-
-        # Apply your rule ONLY when intervention is not regular
-        if iv_raw and (iv_up not in REGULAR_INTERVENTIONS):
-            agency_cell = ws.cell(row=r, column=agency_col)
-            agency_raw = _clean_str(agency_cell.value)
-
-            prefix = f"{iv_raw} - "
-            if not agency_raw.startswith(prefix):
-                agency_cell.value = f"{iv_raw} - {agency_raw}" if agency_raw else f"{iv_raw} -"
-
-            # Convert INTERVENTION to INGOs
-            ws.cell(row=r, column=intervention_col).value = "INGOs"
-            is_converted = True
-
-        # After any conversion, read the final values used for sorting + tracking
-        fuel_val = safe_float(ws.cell(row=r, column=unified_col).value)
-        iv_after = _clean_str(ws.cell(row=r, column=intervention_col).value)
-        desc_key = ws.cell(row=r, column=desc_col).value
-
-        # Track converted rows by stable key (survives sorting/deletions)
-        if is_converted:
-            converted_desc_keys.add(desc_key)
-
-        rows_data.append({
-            "fuel": fuel_val,
-            "intervention": iv_after,
-            "is_converted": is_converted,
-            "orig_index": r,
-            "desc_key": desc_key,
-            "row": snapshot_row(ws, r),
-        })
+    for cluster, agency, desc, fuel, key, unified in ws.iter_rows(min_row=2, max_col=6):
+        key.value = ",".join("" if cell.value is None else str(cell.value) for cell in (cluster, agency, desc))
+        copy_cell_style(cluster, key)
+        copy_cell_style(fuel, unified)
+        totals[key.value] = totals.get(key.value, 0.0) + safe_float(fuel.value)
+    for key, unified in ws.iter_rows(min_row=2, min_col=5, max_col=6):
+        unified.value = totals[key.value]
 
 
-    # ONE sort (tuple key) so behaviour is deterministic:
-    # 1) intervention A–Z
-    # 2) inside INGOs: real INGOs first, converted/prefixed last
-    # 3) fuel DESC only for rows that are NOT converted prefixed INGOs
-    # 4) stable fallback by orig_index
-    def _sort_key(x):
-        iv = (x["intervention"] or "").strip().lower()
-        is_ingos = (iv == "ingos")
-
-        # 0 = purple (real INGOs), 1 = white (converted/prefixed)
-        converted_rank = 1 if (is_ingos and x["is_converted"]) else 0
-
-        # Sort fuel DESC inside BOTH purple and white groups (independently)
-        fuel_rank = -x["fuel"] if is_ingos else -x["fuel"]
-
-        return (iv, converted_rank, fuel_rank, x["orig_index"])
-
-    rows_data.sort(key=_sort_key)
-
-    # Restore rows and rebuild "converted rows" positions AFTER sorting
-    write_row = 2
-    for obj in rows_data:
-        restore_row(ws, write_row, obj["row"])
-        write_row += 1
+def _label(value):
+    return "" if value is None else str(value).strip()
 
 
-    if progress:
-        progress.progress(80)
+def _sort_distribution_rows(ws, intervention_col, agency_col):
+    """Sort by cluster, original/converted INGOs and descending fuel, then keep the first key."""
+    regular = {"ETC", "HEALTH", "WASH", "INGOS", "UN-OHCHR", "WFP", "UN AGENCIES", "LOGISTICS"}
+    rows = []
+    converted_keys = set()
+    for row in ws.iter_rows(min_row=2):
+        intervention = row[intervention_col - 1]
+        agency = row[agency_col - 1]
+        if _contains_ohchr(intervention.value) or _contains_ohchr(agency.value):
+            intervention.value = "LOGISTICS"
+        label = _label(intervention.value)
+        converted = bool(label and label.upper() not in regular)
+        key = row[4].value
+        if converted:
+            prefix = f"{label} - "
+            if not _label(agency.value).startswith(prefix):
+                agency.value = (prefix + _label(agency.value)).rstrip()
+            intervention.value = "INGOs"
+            converted_keys.add(key)
 
-    # Remove duplicates by Description Sum
-    if status:
-        status.info("Removing duplicates…")
+        order = (_label(intervention.value).lower(), converted, -safe_float(row[5].value))
+        rows.append((order, _label(key), row))
 
+    # The stable sort keeps the original order on ties. Snapshot only the winners
+    # before overwriting cells that may also be the source of a later row.
     seen = set()
-    dup_rows = []
-    for r in range(2, ws.max_row + 1):
-        val = ws.cell(row=r, column=desc_col).value
-        key = "" if val is None else str(val).strip()
+    winners = []
+    ordered_rows = sorted(rows, key=lambda item: item[0])
+    for position, (_, key, row) in enumerate(ordered_rows, 2):
         if key in seen:
-            dup_rows.append(r)
+            continue
+        seen.add(key)
+        # The previous sort left Excel's cell-specific flags at each sorted position.
+        cells = [(cell.value, _copy_formatting(cell._style, ws.cell(position, cell.column)._style))
+                 for cell in row]
+        winners.append(cells)
+    for r, values in enumerate(winners, 2):
+        for c, (value, style) in enumerate(values, 1):
+            cell = ws.cell(r, c)
+            cell.value = value
+            cell._style = style
+    if len(winners) < len(rows):
+        ws.delete_rows(2 + len(winners), len(rows) - len(winners))
+    return converted_keys
+
+
+SECTORS = (
+    ("ETC", "תקשורת", "D5F3FB"),
+    ("HEALTH", "בריאות", "00B050"),
+    ("WASH", "סניטציה", "FAB28A"),
+    ("INGOS", "ארגונים לא ממשלתיים", "BE9EF2"),
+    ("UN AGENCIES", 'סוכנויות או"ם', "00B0F0"),
+    ("WFP", "WFP", "2CC3EC"),
+)
+
+
+def _format_categories(ws, intervention_col, converted_keys, fills):
+    if ws.max_column >= 7:
+        ws.insert_cols(7)
+    ws["G1"] = "Total Sum Per Category"
+    copy_cell_style(ws["F1"], ws["G1"])
+    _copy_width(ws, "F", "G")
+
+    totals = {}
+    last = ws.max_row
+    for r in range(2, last + 1):
+        category = _label(ws.cell(r, 1).value)
+        totals[category] = totals.get(category, 0.0) + safe_float(ws.cell(r, 6).value)
+    group_start = 2
+    group_name = None
+    for r in range(2, last + 1):
+        total = ws.cell(r, 7)
+        total.value = totals[_label(ws.cell(r, 1).value)]
+        copy_cell_style(ws.cell(r, 6), total)
+        category = _label(ws.cell(r, intervention_col).value).upper()
+        if group_name is not None and category != group_name:
+            _merge_column_group(ws, 7, group_start, r - 1)
+            group_start = r
+        group_name = category
+    _merge_column_group(ws, 7, group_start, last)
+
+    sector_totals = {}
+    first_rows = {}
+    for r in range(2, last + 1):
+        category = _label(ws.cell(r, intervention_col).value).upper()
+        if category == "LOGISTICS":
+            ws.cell(r, intervention_col).value = "UN Agencies"
+            category = "UN AGENCIES"
+        if not category:
+            continue
+        first_rows.setdefault(category, r)
+        sector_totals[category] = sector_totals.get(category, 0.0) + safe_float(ws.cell(r, 6).value)
+        if category in fills and not (category == "INGOS" and ws.cell(r, 5).value in converted_keys):
+            for col in range(1, 8):
+                ws.cell(r, col).fill = fills[category]
+    return sector_totals, first_rows
+
+
+def _add_sector_summary(wb, ws, intervention_col, totals, first_rows, fills):
+    if "Sector Summary" in wb.sheetnames:
+        wb.remove(wb["Sector Summary"])
+    summary = wb.create_sheet("Sector Summary")
+    summary.append(["סקטור", "כמות דלק (ליטר)", "אחוז"])
+    for header in summary[1]:
+        copy_cell_style(ws["A1"], header)
+    for col, width in (("A", 28), ("B", 18), ("C", 12)):
+        summary.column_dimensions[col].width = width
+    last = len(SECTORS) + 1
+    for r, (key, label, _) in enumerate(SECTORS, 2):
+        a, b, percent = (summary.cell(r, c) for c in (1, 2, 3))
+        a.value, b.value = label, totals.get(key, 0.0)
+        source_row = first_rows.get(key)
+        if source_row is None:
+            copy_cell_style(ws["A1"], a)
+            copy_cell_style(ws["A1"], b)
+            b.number_format = ws["F2"].number_format
         else:
-            seen.add(key)
-    for rr in sorted(dup_rows, reverse=True):
-        ws.delete_rows(rr)
-
-    if progress:
-        progress.progress(86)
-
-    # Total Sum Per Category in G
-    if status:
-        status.info("Building Total Sum Per Category…")
-
-    total_cat_col = 7  # G
-    if ws.max_column >= total_cat_col:
-        ws.insert_cols(total_cat_col)
-
-    ref_total_header = ws.cell(row=header_row, column=unified_col)  # F header
-    total_header = ws.cell(row=header_row, column=total_cat_col)    # G header
-    total_header.value = "Total Sum Per Category"
-    total_header.font = copy(ref_total_header.font)
-    total_header.fill = copy(ref_total_header.fill)
-    total_header.border = copy(ref_total_header.border)
-    total_header.alignment = copy(ref_total_header.alignment)
-    total_header.number_format = ref_total_header.number_format
-    total_header.protection = copy(ref_total_header.protection)
-
-    ref_letter = get_column_letter(unified_col)
-    new_letter = get_column_letter(total_cat_col)
-    if ref_letter in ws.column_dimensions and ws.column_dimensions[ref_letter].width is not None:
-        ws.column_dimensions[new_letter].width = ws.column_dimensions[ref_letter].width
-
-    cat_totals = {}
-    for r in range(2, ws.max_row + 1):
-        cat = ws.cell(row=r, column=1).value
-        cat_key = "" if cat is None else str(cat).strip()
-        fuel_val = safe_float(ws.cell(row=r, column=unified_col).value)
-        cat_totals[cat_key] = cat_totals.get(cat_key, 0.0) + fuel_val
-
-    for r in range(2, ws.max_row + 1):
-        cat = ws.cell(row=r, column=1).value
-        cat_key = "" if cat is None else str(cat).strip()
-
-        target = ws.cell(row=r, column=total_cat_col)
-        style_src = ws.cell(row=r, column=unified_col)
-
-        target.value = cat_totals.get(cat_key, 0.0)
-        target.font = copy(style_src.font)
-        target.fill = copy(style_src.fill)
-        target.border = copy(style_src.border)
-        target.alignment = copy(style_src.alignment)
-        target.number_format = style_src.number_format
-        target.protection = copy(style_src.protection)
-
-    if progress:
-        progress.progress(92)
-
-    # Merge Total Sum Per Category (G) by INTERVENTION
-    if status:
-        status.info('Merging "Total Sum Per Category" by INTERVENTION…')
-
-    INTERVENTION_COL = intervention_col
-    TOTAL_CAT_COL = total_cat_col
-
-    def _norm_intervention(v):
-        return "" if v is None else str(v).strip().upper()
-
-    start = 2
-    while start <= ws.max_row:
-        key = _norm_intervention(ws.cell(row=start, column=INTERVENTION_COL).value)
-
-        end = start
-        while end + 1 <= ws.max_row and _norm_intervention(ws.cell(row=end + 1, column=INTERVENTION_COL).value) == key:
-            end += 1
-
-        if end > start:
-            top_cell = ws.cell(row=start, column=TOTAL_CAT_COL)
-            top_val = top_cell.value
-            top_style = {
-                "font": copy(top_cell.font),
-                "fill": copy(top_cell.fill),
-                "border": copy(top_cell.border),
-                "alignment": copy(top_cell.alignment),
-                "number_format": top_cell.number_format,
-                "protection": copy(top_cell.protection),
-            }
-
-            ws.merge_cells(
-                start_row=start,
-                start_column=TOTAL_CAT_COL,
-                end_row=end,
-                end_column=TOTAL_CAT_COL,
-            )
-
-            merged_top = ws.cell(row=start, column=TOTAL_CAT_COL)
-            merged_top.value = top_val
-            merged_top.font = copy(top_style["font"])
-            merged_top.fill = copy(top_style["fill"])
-            merged_top.border = copy(top_style["border"])
-            merged_top.alignment = copy(top_style["alignment"])
-            merged_top.number_format = top_style["number_format"]
-            merged_top.protection = copy(top_style["protection"])
-
-        start = end + 1
-
-    # OPTIONAL: rename LOGISTICS -> UN Agencies
-    for r in range(2, ws.max_row + 1):
-        v = ws.cell(row=r, column=intervention_col).value
-        if v is None:
-            continue
-        if str(v).strip().upper() == "LOGISTICS":
-            ws.cell(row=r, column=intervention_col).value = "UN Agencies"
-
-    # Color A–G based on INTERVENTION
-    if status:
-        status.info("Applying colours…")
-
-    def _is_converted_row(r: int) -> bool:
-        iv = ws.cell(row=r, column=intervention_col).value
-        if ("" if iv is None else str(iv).strip().upper()) != "INGOS":
-            return False
-        return ws.cell(row=r, column=desc_col).value in converted_desc_keys
-
-    fills = {
-        "ETC": rgb_fill(213, 243, 251),
-        "HEALTH": rgb_fill(0, 176, 80),
-        "WASH": rgb_fill(250, 178, 138),
-        "INGOs": rgb_fill(190, 158, 242),
-        "WFP": rgb_fill(44, 195, 236),
-        "UN_AGENCIES": rgb_fill(0, 176, 240),
-    }
-
-    COLOR_MIN_COL = 1
-    COLOR_MAX_COL = 7
-
-    for r in range(2, ws.max_row + 1):
-        intervention_val = ws.cell(row=r, column=intervention_col).value
-        intervention_text = "" if intervention_val is None else str(intervention_val).strip()
-        intervention_up = intervention_text.upper()
-
-        row_fill = None
-
-        if intervention_up == "WFP":
-            row_fill = fills["WFP"]
-        elif intervention_up == "UN AGENCIES":
-            row_fill = fills["UN_AGENCIES"]
-        elif intervention_up == "ETC":
-            row_fill = fills["ETC"]
-        elif intervention_up == "HEALTH":
-            row_fill = fills["HEALTH"]
-        elif intervention_up == "WASH":
-            row_fill = fills["WASH"]
-        elif intervention_up == "INGOS":
-            # Converted/prefixed rows must remain white; real INGOs must be purple
-            if _is_converted_row(r):
-                row_fill = None
-            else:
-                row_fill = fills["INGOs"]
-
-
-        # CRITICAL: never write None into .fill
-        if row_fill is None:
-            continue
-
-        for c in range(COLOR_MIN_COL, COLOR_MAX_COL + 1):
-            ws.cell(row=r, column=c).fill = row_fill
-
-
-    # Summary sheet (Sector Summary) + pie chart
-    totals_by_intervention = {}
-    for r in range(2, ws.max_row + 1):
-        iv = ws.cell(row=r, column=intervention_col).value
-        iv_key = "" if iv is None else str(iv).strip()
-        if iv_key == "":
-            continue
-        totals_by_intervention[iv_key.upper()] = totals_by_intervention.get(iv_key.upper(), 0.0) + safe_float(
-            ws.cell(row=r, column=unified_col).value
-        )
-
-    sector_rows = [
-        ("ETC", "תקשורת"),
-        ("HEALTH", "בריאות"),
-        ("WASH", "סניטציה"),
-        ("INGOS", "ארגונים לא ממשלתיים"),
-        ("UN AGENCIES", 'סוכנויות או"ם'),
-        ("WFP", "WFP"),
-    ]
-
-    SUMMARY_SHEET_NAME = "Sector Summary"
-    if SUMMARY_SHEET_NAME in wb.sheetnames:
-        wb.remove(wb[SUMMARY_SHEET_NAME])
-    ws_sum = wb.create_sheet(SUMMARY_SHEET_NAME)
-
-    ws_sum["A1"].value = "סקטור"
-    ws_sum["B1"].value = "כמות דלק (ליטר)"
-
-    header_fill = PatternFill("solid", fgColor="000000")
-    header_font = Font(color="FFFFFF", bold=True)
-    for cell_ref in ("A1", "B1", "C1"):
-        cell = ws_sum[cell_ref]
-        cell.fill = header_fill
-        cell.font = header_font
-
-    hdr_src = ws.cell(row=1, column=1)
-    for addr in ("A1", "B1"):
-        c = ws_sum[addr]
-        c.font = copy(hdr_src.font)
-        c.fill = copy(hdr_src.fill)
-        c.border = copy(hdr_src.border)
-        c.alignment = copy(hdr_src.alignment)
-        c.number_format = hdr_src.number_format
-        c.protection = copy(hdr_src.protection)
-
-    ws_sum.column_dimensions["A"].width = 28
-    ws_sum.column_dimensions["B"].width = 18
-
-    num_src = ws.cell(row=2, column=unified_col)
-    litres_number_format = num_src.number_format
-
-    summary_fills = {
-        "ETC": fills["ETC"],
-        "HEALTH": fills["HEALTH"],
-        "WASH": fills["WASH"],
-        "INGOS": fills["INGOs"],
-        "UN AGENCIES": fills.get("UN_AGENCIES", rgb_fill(0, 176, 240)),
-        "WFP": fills["WFP"],
-    }
-
-    style_row_by_intervention = {}
-    for r in range(2, ws.max_row + 1):
-        iv = ws.cell(row=r, column=intervention_col).value
-        k = "" if iv is None else str(iv).strip().upper()
-        if k and k not in style_row_by_intervention:
-            style_row_by_intervention[k] = r
-
-    row_i = 2
-    for key_en, label_he in sector_rows:
-        key_u = key_en.strip().upper()
-
-        src_r = style_row_by_intervention.get(key_u)
-
-        a_cell = ws_sum.cell(row=row_i, column=1)
-        b_cell = ws_sum.cell(row=row_i, column=2)
-
-        a_cell.value = label_he
-        b_cell.value = totals_by_intervention.get(key_u, 0.0)
-
-        if src_r is not None:
-            src_a = ws.cell(row=src_r, column=intervention_col)
-            src_b = ws.cell(row=src_r, column=unified_col)
-            copy_cell_style(src_a, a_cell)
-            copy_cell_style(src_b, b_cell)
-        else:
-            copy_cell_style(hdr_src, a_cell)
-            copy_cell_style(hdr_src, b_cell)
-            b_cell.number_format = litres_number_format
-
-        fill_obj = summary_fills.get(key_u)
-        if fill_obj:
-            a_cell.fill = fill_obj
-            b_cell.fill = fill_obj
-
-        row_i += 1
-
-    FIRST_ROW = 2
-    LAST_ROW = FIRST_ROW + len(sector_rows) - 1
-
-    ws_sum["C1"].value = "אחוז"
-    copy_cell_style(ws_sum["A1"], ws_sum["C1"])
-    ws_sum.column_dimensions["C"].width = 12
-
-    for r in range(FIRST_ROW, LAST_ROW + 1):
-        ws_sum.cell(row=r, column=3).value = f"=B{r}/SUM($B${FIRST_ROW}:$B${LAST_ROW})"
-        copy_cell_style(ws_sum.cell(row=r, column=2), ws_sum.cell(row=r, column=3))
-        ws_sum.cell(row=r, column=3).number_format = "0.0%"
+            copy_cell_style(ws.cell(source_row, intervention_col), a)
+            copy_cell_style(ws.cell(source_row, 6), b)
+        a.fill = b.fill = fills[key]
+        percent.value = f"=B{r}/SUM($B$2:$B${last})"
+        copy_cell_style(b, percent)
+        percent.number_format = "0.0%"
 
     pie = PieChart()
-    data = Reference(ws_sum, min_col=2, min_row=1, max_row=LAST_ROW)
-    cats = Reference(ws_sum, min_col=1, min_row=FIRST_ROW, max_row=LAST_ROW)
-    pie.add_data(data, titles_from_data=True)
-    pie.set_categories(cats)
-
+    pie.add_data(Reference(summary, min_col=2, min_row=1, max_row=last), titles_from_data=True)
+    pie.set_categories(Reference(summary, min_col=1, min_row=2, max_row=last))
     pie.title = ""
     pie.dataLabels = DataLabelList()
-    pie.dataLabels.showCatName = True
-    pie.dataLabels.showPercent = True
-    pie.dataLabels.showVal = False
-    pie.dataLabels.showSerName = False
-    pie.dataLabels.showLeaderLines = True
+    pie.dataLabels.showCatName = pie.dataLabels.showPercent = pie.dataLabels.showLeaderLines = True
+    pie.dataLabels.showVal = pie.dataLabels.showSerName = False
     pie.dataLabels.separator = "\n"
     pie.legend = None
+    for i, (_, _, colour) in enumerate(SECTORS):
+        point = DataPoint(idx=i)
+        point.graphicalProperties.solidFill = colour
+        pie.series[0].dPt.append(point)
+    summary.add_chart(pie, "E2")
+    return summary
 
-    slice_colors = [
-        "D5F3FB",
-        "00B050",
-        "FAB28A",
-        "BE9EF2",
-        "00B0F0",
-        "2CC3EC",
-    ]
 
-    ser = pie.series[0]
-    ser.dPt = []
-    for i, hx in enumerate(slice_colors[: len(sector_rows)]):
-        dp = DataPoint(idx=i)
-        dp.graphicalProperties.solidFill = hx
-        ser.dPt.append(dp)
+def calculate_distribution(wb, progress=None, status=None):
+    """Clean the combined sheet, aggregate distribution rows and create Sector Summary."""
+    def update(percent, message):
+        if progress is not None:
+            progress.progress(percent)
+        if status is not None:
+            status.info(message)
 
-    ws_sum.add_chart(pie, "E2")
+    names = {name.strip(): name for name in wb.sheetnames}
+    if DISTRIBUTION_SHEET_NAME not in names:
+        raise RuntimeError(f'Sheet "{DISTRIBUTION_SHEET_NAME}" not found. Sheets found: {list(names)}')
+    ws = wb[names[DISTRIBUTION_SHEET_NAME]]
+    for sheet in list(wb):
+        if sheet is not ws:
+            wb.remove(sheet)
+    ws.title = DISTRIBUTION_SHEET_NAME
 
-    if progress:
+    update(10, "Unmerging A–C and removing TOTAL rows…")
+    unmerge_and_fill(ws, 1, 3)
+    ws.delete_rows(2)
+    removed = [row[0].row for row in ws.iter_rows(max_col=3)
+               if any("TOTAL" in str(cell.value).upper() for cell in row)]
+    _delete_rows_together(ws, removed)
+    normalise_distribution_description_usage_markers(ws)
+    update(34, "Calculating fuel totals…")
+    _add_fuel_columns(ws)
+
+    headers = {norm_header(cell.value): cell.column for cell in ws[1] if cell.value is not None}
+    intervention_col = headers.get("INTERVENTION", 1)
+    if "AGENCY" not in headers:
+        raise RuntimeError('Header "AGENCY" not found.')
+    update(72, "Sorting and removing duplicate descriptions…")
+    converted_keys = _sort_distribution_rows(ws, intervention_col, headers["AGENCY"])
+    update(86, "Calculating and formatting sector totals…")
+    fills = {key: PatternFill("solid", fgColor="FF" + colour) for key, _, colour in SECTORS}
+    totals, first_rows = _format_categories(ws, intervention_col, converted_keys, fills)
+    summary = _add_sector_summary(wb, ws, intervention_col, totals, first_rows, fills)
+    remove_bold_except_header(ws)
+    style_headers_black_only_with_text(ws)
+    style_headers_black_only_with_text(summary)
+    if progress is not None:
         progress.progress(100)
-
-    # Remove ALL bold on Distribution Summary except header row
-    remove_bold_except_header(ws, header_row=1)
-
-    # Force header style on both sheets
-    style_headers_black_only_with_text(ws, header_row=1)      # Distribution Summary
-    style_headers_black_only_with_text(ws_sum, header_row=1)  # Sector Summary
-
-    out = BytesIO()
-    wb.save(out)
-    wb.close()
-    out.seek(0)
-    gc.collect()
-    return out
+    return wb
 
 
-# ============================================================
-# FUEL DASHBOARD HELPERS (added from standalone Fuel Overview app)
-# ============================================================
+def run_calculations_on_combined_bytes(combined_bytes: BytesIO, progress=None, status=None) -> BytesIO:
+    combined_bytes.seek(0)
+    with closing(load_workbook(combined_bytes)) as workbook:
+        calculate_distribution(workbook, progress, status)
+        return workbook_bytes(workbook)
 
-def find_cell_exact(ws, text: str):
-    target = text.strip().upper()
-    for r in range(1, ws.max_row + 1):
-        for c in range(1, ws.max_column + 1):
-            value = ws.cell(r, c).value
+
+# Latest-day workbook extraction and Fuel Dashboard
+
+
+def _search_sheet(ws, text, exact):
+    target = text.strip().upper() if exact else text.upper()
+    for r, row in enumerate(ws.iter_rows(values_only=True), 1):
+        for c, value in enumerate(row, 1):
             if value is None:
                 continue
-            if str(value).strip().upper() == target:
+            label = str(value).upper()
+            if (label.strip() == target if exact else target in label):
                 return r, c
     return None, None
+
+
+def find_cell_exact(ws, text: str):
+    return _search_sheet(ws, text, exact=True)
 
 
 def find_cell_containing(ws, text: str):
-    target = text.upper()
-    for r in range(1, ws.max_row + 1):
-        for c in range(1, ws.max_column + 1):
-            value = ws.cell(r, c).value
-            if value is not None and target in str(value).upper():
-                return r, c
-    return None, None
+    return _search_sheet(ws, text, exact=False)
 
 
 def normalise_date(v):
@@ -1735,7 +1127,7 @@ def _debug_value(value, max_len=90):
     return text
 
 
-def _describe_row(ws, row, start_col=1, end_col=None, include_blanks=False):
+def _describe_row(ws, row, start_col=1, end_col=None, include_blanks=False, value_at=None):
     if row is None or row < 1 or row > ws.max_row:
         return "(row unavailable)"
 
@@ -1743,20 +1135,21 @@ def _describe_row(ws, row, start_col=1, end_col=None, include_blanks=False):
     start_col = max(1, start_col)
     parts = []
     for c in range(start_col, end_col + 1):
-        value = ws.cell(row=row, column=c).value
+        value = value_at(row, c) if value_at else ws.cell(row, c).value
         if not include_blanks and (value is None or str(value).strip() == ""):
             continue
         parts.append(f"{cell_ref(row, c)}={_debug_value(value)}")
     return ", ".join(parts) if parts else "(no non-empty cells)"
 
 
-def _closest_cells(ws, target_text, max_results=6):
+def _closest_cells(ws, target_text, max_results=6, value_at=None):
     """Return a few cells whose text most closely resembles the missing label."""
     target = norm_header(target_text)
     scored = []
-    for r in range(1, ws.max_row + 1):
-        for c in range(1, ws.max_column + 1):
-            value = ws.cell(r, c).value
+    for r, row in enumerate(ws.iter_rows(values_only=True), 1):
+        for c, value in enumerate(row, 1):
+            if value_at is not None and value is None:
+                value = value_at(r, c)
             if value is None or str(value).strip() == "":
                 continue
             candidate = norm_header(value)
@@ -1786,12 +1179,13 @@ def _fuel_structure_error(
     header_row=None,
     scan_start_col=None,
     scan_end_col=None,
+    value_at=None,
 ):
     """Build a detailed error that points to the exact workbook area that failed."""
     lines = [
         "Fuel Dashboard structure error",
         f"File: {uploaded_file.name}",
-        f"Detected organisation: {detect_org(uploaded_file.name, uploaded_file)}",
+        f"Detected organisation: {_identify_org(uploaded_file.name, wb)}",
         f"Stage: {stage}",
         f"Sheet: {ws.title if ws is not None else '(sheet not found)'}",
         f"Expected: {expected}",
@@ -1812,16 +1206,16 @@ def _fuel_structure_error(
             f"{get_column_letter(max(1, start_col))}:{get_column_letter(min(end_col, ws.max_column))}"
         )
         lines.append(
-            f"Values on scanned row: {_describe_row(ws, header_row, start_col, end_col, include_blanks=True)}"
+            f"Values on scanned row: {_describe_row(ws, header_row, start_col, end_col, include_blanks=True, value_at=value_at)}"
         )
 
         nearby = []
         for r in range(max(1, header_row - 2), min(ws.max_row, header_row + 2) + 1):
-            nearby.append(f"Row {r}: {_describe_row(ws, r, start_col, end_col)}")
+            nearby.append(f"Row {r}: {_describe_row(ws, r, start_col, end_col, value_at=value_at)}")
         lines.append("Nearby rows:\n  " + "\n  ".join(nearby))
 
     similarity_target = similar_to or expected
-    lines.append(f"Closest similar cells: {_closest_cells(ws, similarity_target) if ws is not None else '(not available)'}")
+    lines.append(f"Closest similar cells: {_closest_cells(ws, similarity_target, value_at=value_at) if ws is not None else '(not available)'}")
     lines.append(
         "Likely causes: the header was renamed, moved to another row, merged differently, "
         "or contains extra/hidden characters."
@@ -1829,38 +1223,49 @@ def _fuel_structure_error(
     return RuntimeError("\n".join(lines))
 
 
-def detect_org(filename: str, uploaded_file=None) -> str:
-    """Identify source from workbook content, not only its generic filename."""
+def _identify_org(filename, workbook=None):
     name = filename.upper()
-    if "UNOPS" in name:
-        return "UNOPS"
-    if "WFP" in name:
-        return "WFP"
-
-    if uploaded_file is not None:
-        wb = load_workbook(BytesIO(uploaded_file.getvalue()), read_only=True, data_only=True)
-        try:
-            names = {n.strip().upper() for n in wb.sheetnames}
-            if any("UNOPS TOTAL DISTRIBUTION" in n for n in names) or "FUEL RECEIPTS SUMMARY" in names:
-                return "UNOPS"
-            if any("WFP TOTAL DISTRIBUTION" in n for n in names):
-                return "WFP"
-            if "SUMMARY" in names:
-                ws = wb[next(n for n in wb.sheetnames if n.strip().upper() == "SUMMARY")]
-                for row in ws.iter_rows(min_row=1, max_row=35, max_col=6, values_only=True):
-                    if any(isinstance(v, str) and v.strip().upper() == "UNOPS" for v in row):
-                        return "UNOPS"
-        finally:
-            wb.close()
-
+    for org in ("UNOPS", "WFP"):
+        if org in name:
+            return org
+    if workbook is not None:
+        names = {n.strip().upper() for n in workbook.sheetnames}
+        if any("UNOPS TOTAL DISTRIBUTION" in n for n in names) or "FUEL RECEIPTS SUMMARY" in names:
+            return "UNOPS"
+        if any("WFP TOTAL DISTRIBUTION" in n for n in names):
+            return "WFP"
+        if "SUMMARY" in names:
+            summary = get_sheet_by_normalised_name(workbook, ["Summary"])
+            for row in summary.iter_rows(min_row=1, max_row=35, max_col=6, values_only=True):
+                if any(isinstance(v, str) and v.strip().upper() == "UNOPS" for v in row):
+                    return "UNOPS"
     raise RuntimeError(f"Could not identify UNOPS or WFP for '{filename}'. Check the workbook structure.")
 
 
-def extract_current_fuel_from_file(uploaded_file):
-    org = detect_org(uploaded_file.name, uploaded_file)
-    raw = BytesIO(uploaded_file.getvalue())
-    wb = load_workbook(raw, data_only=True)
+def detect_org(filename: str, uploaded_file=None) -> str:
+    if uploaded_file is None or any(org in filename.upper() for org in TARGET_SHEETS):
+        return _identify_org(filename)
+    with closing(load_workbook(BytesIO(uploaded_file.getvalue()), read_only=True, data_only=True, keep_links=False)) as wb:
+        return _identify_org(filename, wb)
 
+
+def _horizontal_values(ws):
+    """Read across merged labels, leaving lower rows and the original worksheet untouched."""
+    expanded = {}
+    for merged in ws.merged_cells.ranges:
+        value = ws.cell(merged.min_row, merged.min_col).value
+        for c in range(merged.min_col + 1, merged.max_col + 1):
+            expanded[merged.min_row, c] = value
+
+    def value_at(r, c):
+        if (r, c) in expanded:
+            return expanded[r, c]
+        return ws.cell(r, c).value
+
+    return value_at
+
+
+def _read_current_fuel(wb, uploaded_file, org):
     if "Summary" not in wb.sheetnames:
         raise RuntimeError(
             "Fuel Dashboard structure error\n"
@@ -1873,12 +1278,7 @@ def extract_current_fuel_from_file(uploaded_file):
 
     ws = wb["Summary"]
 
-    # Fill merged cells only horizontally to avoid duplicating WFP station names vertically.
-    for mr in list(ws.merged_cells.ranges):
-        value = ws.cell(mr.min_row, mr.min_col).value
-        ws.unmerge_cells(str(mr))
-        for c in range(mr.min_col, mr.max_col + 1):
-            ws.cell(mr.min_row, c).value = value
+    value_at = _horizontal_values(ws)
 
     header_row, station_col = find_cell_containing(ws, "Fuel Station - Address")
     if not header_row:
@@ -1886,6 +1286,7 @@ def extract_current_fuel_from_file(uploaded_file):
             uploaded_file,
             wb,
             ws,
+            value_at=value_at,
             stage="Current fuel by station",
             expected='cell containing "Fuel Station - Address"',
             similar_to="Fuel Station - Address",
@@ -1897,7 +1298,7 @@ def extract_current_fuel_from_file(uploaded_file):
     scan_end_col = ws.max_column
 
     for c in range(scan_start_col, scan_end_col + 1):
-        val = ws.cell(header_row, c).value
+        val = value_at(header_row, c)
         txt = "" if val is None else str(val).strip().upper()
         if txt in ("DIESEL", "DIESEL (LITERS)"):
             diesel_col = c
@@ -1911,6 +1312,7 @@ def extract_current_fuel_from_file(uploaded_file):
             uploaded_file,
             wb,
             ws,
+            value_at=value_at,
             stage="Current fuel by station -> Diesel/Petrol header detection",
             expected='header equal to "Diesel" or "Diesel (Liters)"',
             similar_to="Diesel",
@@ -1928,6 +1330,7 @@ def extract_current_fuel_from_file(uploaded_file):
             uploaded_file,
             wb,
             ws,
+            value_at=value_at,
             stage="Current fuel by station -> Diesel/Petrol header detection",
             expected='header equal to "Petrol" or "Petrol (Liters)"',
             similar_to="Petrol",
@@ -1940,25 +1343,23 @@ def extract_current_fuel_from_file(uploaded_file):
             scan_end_col=scan_end_col,
         )
 
+    width = ws.max_column
     rows = []
     seen = set()
     for r in range(header_row + 1, ws.max_row + 1):
-        row_text = " ".join(
-            str(ws.cell(r, c).value)
-            for c in range(1, ws.max_column + 1)
-            if ws.cell(r, c).value is not None
-        ).upper()
+        row_values = (value_at(r, c) for c in range(1, width + 1))
+        row_text = " ".join(str(value) for value in row_values if value is not None).upper()
 
         if "CURRENT FUEL IN STORAGE" in row_text:
             break
 
-        station = ws.cell(r, station_col).value
+        station = value_at(r, station_col)
         if station is None or str(station).strip() == "":
             continue
 
         station_name = str(station).strip()
-        diesel = safe_float(ws.cell(r, diesel_col).value)
-        petrol = safe_float(ws.cell(r, petrol_col).value)
+        diesel = safe_float(value_at(r, diesel_col))
+        petrol = safe_float(value_at(r, petrol_col))
         key = (org, station_name, diesel, petrol)
         if key in seen:
             continue
@@ -1975,22 +1376,12 @@ def extract_current_fuel_from_file(uploaded_file):
     return rows
 
 
-def extract_daily_fuel_entries(uploaded_file, selected_dates):
-    org = detect_org(uploaded_file.name, uploaded_file)
-    raw = BytesIO(uploaded_file.getvalue())
-    wb = load_workbook(raw, data_only=True)
-
+def _read_daily_entries(wb, uploaded_file, org, selected_dates):
     ws = get_sheet_by_normalised_name(wb, ["Comulative Fuel Entry", "Cumulative Fuel Entry"])
     if ws is None:
         raise RuntimeError(f'"Comulative Fuel Entry" not found in "{uploaded_file.name}".')
 
-    # Fill merged cells horizontally only, so merged headers like "Note" are readable
-    # without wrongly duplicating values down the sheet.
-    for mr in list(ws.merged_cells.ranges):
-        value = ws.cell(mr.min_row, mr.min_col).value
-        ws.unmerge_cells(str(mr))
-        for c in range(mr.min_col, mr.max_col + 1):
-            ws.cell(mr.min_row, c).value = value
+    value_at = _horizontal_values(ws)
 
     date_row, date_col = find_cell_containing(ws, "Date")
     diesel_row, diesel_col = find_cell_containing(ws, "Total Diesel Received")
@@ -2016,7 +1407,7 @@ def extract_daily_fuel_entries(uploaded_file, selected_dates):
 
         for r in range(min_header_row, max_header_row + 1):
             for c in range(search_start_col, search_end_col + 1):
-                val = ws.cell(r, c).value
+                val = value_at(r, c)
                 txt = "" if val is None else str(val).strip().upper()
                 if txt == "NOTE":
                     note_col = c
@@ -2028,21 +1419,21 @@ def extract_daily_fuel_entries(uploaded_file, selected_dates):
     results = {}
 
     for r in range(date_row + 1, ws.max_row + 1):
-        current_date = normalise_date(ws.cell(r, date_col).value)
+        current_date = normalise_date(value_at(r, date_col))
         if current_date is None or current_date not in selected_dates:
             continue
 
         # WFP-only exclusion:
         # If Note says "From UNOPS", ignore this row completely.
         if org == "WFP" and note_col is not None:
-            note_value = ws.cell(r, note_col).value
+            note_value = value_at(r, note_col)
             note_text = "" if note_value is None else str(note_value).strip().upper()
 
             if "FROM UNOPS" in note_text:
                 continue
 
-        diesel = safe_float(ws.cell(r, diesel_col).value)
-        benzene = safe_float(ws.cell(r, benzene_col).value)
+        diesel = safe_float(value_at(r, diesel_col))
+        benzene = safe_float(value_at(r, benzene_col))
 
         # Add to existing date total instead of replacing it,
         # in case the same date appears more than once.
@@ -2050,12 +1441,10 @@ def extract_daily_fuel_entries(uploaded_file, selected_dates):
 
     return org, results
 
-def extract_fuel_used(uploaded_file, selected_dates, logs=None):
-    org = detect_org(uploaded_file.name, uploaded_file)
+
+def _read_fuel_used(wb, uploaded_file, org, selected_dates, logs=None):
     add_log(logs, f"========== Fuel Used | {uploaded_file.name} | detected org: {org} ==========")
 
-    raw = BytesIO(uploaded_file.getvalue())
-    wb = load_workbook(raw, data_only=True)
     ws = get_sheet_by_normalised_name(
         wb,
         [
@@ -2152,21 +1541,14 @@ def extract_fuel_used(uploaded_file, selected_dates, logs=None):
     return org, total_used
 
 
-def extract_fuel_storage(uploaded_file, logs=None):
-    org = detect_org(uploaded_file.name, uploaded_file)
+def _read_storage(wb, uploaded_file, org, logs=None):
     add_log(logs, f"========== Fuel Storage | {uploaded_file.name} | detected org: {org} ==========")
 
-    raw = BytesIO(uploaded_file.getvalue())
-    wb = load_workbook(raw, data_only=True)
     if "Summary" not in wb.sheetnames:
         raise RuntimeError(f'"Summary" sheet not found in "{uploaded_file.name}".')
 
     ws = wb["Summary"]
-    # Unmerge without filling so the structure stays:
-    # Current Fuel In storage (L) | empty | Diesel | Petrol
-    for mr in list(ws.merged_cells.ranges):
-        ws.unmerge_cells(str(mr))
-
+    # Only anchors have values on the untouched Summary sheet.
     storage_row, storage_col = find_cell_containing(ws, "Current Fuel In storage")
     if not storage_row:
         raise RuntimeError(f'"Current Fuel In storage (L)" not found in "{uploaded_file.name}".')
@@ -2197,6 +1579,43 @@ def extract_fuel_storage(uploaded_file, logs=None):
     return org, diesel + petrol
 
 
+@contextmanager
+def _open_fuel_source(upload):
+    with closing(load_workbook(BytesIO(upload.getvalue()), data_only=True, keep_links=False)) as wb:
+        yield wb, _identify_org(upload.name, wb)
+
+
+def extract_current_fuel_from_file(uploaded_file):
+    with _open_fuel_source(uploaded_file) as (wb, org):
+        return _read_current_fuel(wb, uploaded_file, org)
+
+
+def extract_daily_fuel_entries(uploaded_file, selected_dates):
+    with _open_fuel_source(uploaded_file) as (wb, org):
+        return _read_daily_entries(wb, uploaded_file, org, selected_dates)
+
+
+def extract_fuel_used(uploaded_file, selected_dates, logs=None):
+    with _open_fuel_source(uploaded_file) as (wb, org):
+        return _read_fuel_used(wb, uploaded_file, org, selected_dates, logs)
+
+
+def extract_fuel_storage(uploaded_file, logs=None):
+    with _open_fuel_source(uploaded_file) as (wb, org):
+        return _read_storage(wb, uploaded_file, org, logs)
+
+
+@contextmanager
+def _fuel_step(upload, org, description):
+    try:
+        yield
+    except Exception as exc:
+        raise RuntimeError(
+            f"Fuel Dashboard processing failed\nFile: {upload.name}\nDetected organisation: {org}\n"
+            f"Sub-step: {description}\n\nDetails:\n{exc}"
+        ) from exc
+
+
 def add_fuel_dashboard_sheet(
     wb,
     latest_uploads,
@@ -2210,56 +1629,16 @@ def add_fuel_dashboard_sheet(
     fuel_used_by_org = {}
     fuel_storage_by_org = {}
 
-    for uploaded_file in latest_uploads:
-        org_guess = detect_org(uploaded_file.name, uploaded_file)
-
-        try:
-            current_rows = extract_current_fuel_from_file(uploaded_file)
-            all_rows.extend(current_rows)
-        except Exception as e:
-            raise RuntimeError(
-                "Fuel Dashboard processing failed\n"
-                f"File: {uploaded_file.name}\n"
-                f"Detected organisation: {org_guess}\n"
-                "Sub-step: 1/4 - Read current fuel by station\n\n"
-                f"Details:\n{e}"
-            ) from e
-
-        try:
-            org, org_entries = extract_daily_fuel_entries(uploaded_file, selected_dates)
-            daily_entries[org] = org_entries
-        except Exception as e:
-            raise RuntimeError(
-                "Fuel Dashboard processing failed\n"
-                f"File: {uploaded_file.name}\n"
-                f"Detected organisation: {org_guess}\n"
-                "Sub-step: 2/4 - Read cumulative fuel entries\n\n"
-                f"Details:\n{e}"
-            ) from e
-
-        try:
-            org, used_total = extract_fuel_used(uploaded_file, selected_dates, logs=logs)
-            fuel_used_by_org[org] = used_total
-        except Exception as e:
-            raise RuntimeError(
-                "Fuel Dashboard processing failed\n"
-                f"File: {uploaded_file.name}\n"
-                f"Detected organisation: {org_guess}\n"
-                "Sub-step: 3/4 - Calculate fuel used\n\n"
-                f"Details:\n{e}"
-            ) from e
-
-        try:
-            org, storage_total = extract_fuel_storage(uploaded_file, logs=logs)
-            fuel_storage_by_org[org] = storage_total
-        except Exception as e:
-            raise RuntimeError(
-                "Fuel Dashboard processing failed\n"
-                f"File: {uploaded_file.name}\n"
-                f"Detected organisation: {org_guess}\n"
-                "Sub-step: 4/4 - Read current fuel in storage\n\n"
-                f"Details:\n{e}"
-            ) from e
+    for upload in latest_uploads:
+        with _open_fuel_source(upload) as (source, org):
+            with _fuel_step(upload, org, "1/4 - Read current fuel by station"):
+                all_rows.extend(_read_current_fuel(source, upload, org))
+            with _fuel_step(upload, org, "2/4 - Read cumulative fuel entries"):
+                _, daily_entries[org] = _read_daily_entries(source, upload, org, selected_dates)
+            with _fuel_step(upload, org, "3/4 - Calculate fuel used"):
+                _, fuel_used_by_org[org] = _read_fuel_used(source, upload, org, selected_dates, logs)
+            with _fuel_step(upload, org, "4/4 - Read current fuel in storage"):
+                _, fuel_storage_by_org[org] = _read_storage(source, upload, org, logs)
 
     if sheet_name in wb.sheetnames:
         wb.remove(wb[sheet_name])
@@ -2395,66 +1774,10 @@ def add_fuel_dashboard_sheet(
 
     return wb
 
-# ============================================================
-# Settings
-# ============================================================
-STATUS_COL_NAME = "סטטוס"
-UNKNOWN_ENTITIES_STATUS = "ארגונים/גופים לא מוכרים (INGOs/חברות מקומיות)"
-DISTRIBUTION_SHEET_NAME = "Distribution Summary"
-FUZZY_THRESHOLD = 0.78
 
-APPROVAL_SHEETS = {
-    "UNOPS": ["UNOPS Total Distribution", "UNOPS Total Distribution "],
-    "WFP": ["WFP Total Distribution"],
-}
-
-# The original cleaner may prefix local/non-standard agencies like:
-#   NNGOs - Culture and Free Thought Association (CFTA)
-# while the approved list stores:
-#   Culture and Free Thought Association (CFTA)
-# More prefixes are added dynamically from the approval workbook clusters/interventions.
-BASE_GENERATED_PREFIXES = {
-    "NNGOS",
-    "NNGO",
-    "FINANCIAL INSTITUTIONS",
-    "FINANCIAL INSTITUTION",
-    "UN-OHCHR",
-    "UN OHCHR",
-    "UN - SISTERS LOGISTICS",
-    "UN SISTERS LOGISTICS",
-    "UN - SISTERS AGENCIES",
-    "UN SISTERS AGENCIES",
-    "PROTECTION",
-    "SHELTER",
-    "EDUCATION",
-    "NUTRITION",
-    "LOGISTICS",
-    "FOOD SECURITY",
-    "LOCAL AUTHORITIES",
-    "CCCM",
-}
-
-STATUS_FILL_RULES = [
-    ("מסורב", "F4B084"),
-    ("מוקפא", "B4C6E7"),
-    ("מאפיות", "FFE699"),
-    ("מאושר", "C6E0B4"),
-    ("שותפים", "E2F0D9"),
-    ("בריאות", "C6E0B4"),
-    ("תקשורת", "DDEBF7"),
-    ("סניטציה", "FCE4D6"),
-    ("סוכנויות", "D9EAD3"),
-    ("ארגונים/גופים לא מוכרים", "C044E8"),
-    ("חברות מקומיות", "C044E8"),
-    ("לא מוכרים", "C044E8"),
-    ("NOT FOUND", "D9D9D9"),
-    ("UNKNOWN", "D9D9D9"),
-]
+# Approval matching
 
 
-# ============================================================
-# Normalisation + matching helpers
-# ============================================================
 def _norm_prefix(value) -> str:
     if value is None:
         return ""
@@ -2466,45 +1789,49 @@ def _norm_prefix(value) -> str:
     return s
 
 
+@lru_cache(maxsize=32)
+def _prefix_rules(prefixes):
+    names = frozenset(_norm_prefix(p) for p in prefixes if p) - {""}
+    patterns = [re.escape(p) for p in sorted(names, key=len, reverse=True)]
+    literal = re.compile(r"^\s*(?:" + "|".join(patterns) + r")\s*[-–—:]\s*", re.IGNORECASE) if patterns else None
+    return names, literal
+
+
 def strip_generated_prefix(value, prefixes=None) -> str:
-    """Remove prefixes added by the cleaner, for example 'NNGOs - ...'."""
-    if value is None:
+    """Strip successive category prefixes only when they end in a dash or colon."""
+    text = _label(value)
+    if not text:
         return ""
+    names, literal = _prefix_rules(frozenset(prefixes or BASE_GENERATED_PREFIXES))
+    while text:
+        parts = re.split(r"\s*[-–—:]\s*", text, maxsplit=1)
+        if len(parts) == 1:
+            break
+        if _norm_prefix(parts[0]) in names:
+            text = parts[1].strip()
+            continue
+        match = literal.match(text) if literal is not None else None
+        if match is None:
+            break
+        text = text[match.end():].strip()
+    return text
 
-    s = str(value).strip()
-    if not s:
-        return ""
 
-    prefixes = prefixes or BASE_GENERATED_PREFIXES
-    norm_prefixes = sorted({_norm_prefix(p) for p in prefixes if p}, key=len, reverse=True)
-
-    changed = True
-    while changed:
-        changed = False
-        s_norm = _norm_prefix(s)
-
-        for prefix in norm_prefixes:
-            if not prefix:
-                continue
-
-            # Prefix may contain punctuation in the original text, so compare a normalised left side.
-            # We only remove when the actual text has a dash/colon separator after the prefix area.
-            parts = re.split(r"\s*[-–—:]\s*", s, maxsplit=1)
-            if len(parts) == 2 and _norm_prefix(parts[0]) == prefix:
-                s = parts[1].strip()
-                changed = True
-                break
-
-            # Handles cases like 'UN - Sisters Logistics - UN - Sisters Agencies'.
-            # Try removing a normalised prefix from the beginning when the next visible char is a separator.
-            pattern = re.compile(r"^\s*" + re.escape(str(prefix)) + r"\s*[-–—:]\s*", re.IGNORECASE)
-            new_s = pattern.sub("", s).strip()
-            if new_s != s:
-                s = new_s
-                changed = True
-                break
-
-    return s
+NAME_REPLACEMENTS = {
+    "INTL": "INTERNATIONAL",
+    "INT": "INTERNATIONAL",
+    "ORG": "ORGANIZATION",
+    "ASSOC": "ASSOCIATION",
+    "PROGRAMME": "PROGRAM",
+    "SOCAITY": "SOCIETY",
+    "CLOBAL": "GLOBAL",
+    "PH": "PROJECT HOPE",
+    "ACF": "ACTION AGAINST HUNGER",
+    "SI": "SOLIDARITES INTERNATIONALE",
+    "GC": "GLOBAL COMMUNITIES",
+    "MG": "MED GLOBAL",
+    "PIB": "PALESTINE ISLAMIC BANK",
+}
 
 
 def norm_text(value, prefixes=None) -> str:
@@ -2522,27 +1849,16 @@ def norm_text(value, prefixes=None) -> str:
     s = re.sub(r"[^A-Z0-9א-ת]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
 
-    replacements = {
-        "INTL": "INTERNATIONAL",
-        "INT": "INTERNATIONAL",
-        "ORG": "ORGANIZATION",
-        "ASSOC": "ASSOCIATION",
-        "PROGRAMME": "PROGRAM",
-        "SOCAITY": "SOCIETY",
-        "CLOBAL": "GLOBAL",
-        "PH": "PROJECT HOPE",
-        "ACF": "ACTION AGAINST HUNGER",
-        "SI": "SOLIDARITES INTERNATIONALE",
-        "GC": "GLOBAL COMMUNITIES",
-        "MG": "MED GLOBAL",
-        "PIB": "PALESTINE ISLAMIC BANK",
-    }
-    words = [replacements.get(w, w) for w in s.split()]
+    words = [NAME_REPLACEMENTS.get(w, w) for w in s.split()]
     return " ".join(words)
 
 
+def _join_key(*parts):
+    return " | ".join(part for part in parts if part)
+
+
 def compact_key(*parts, prefixes=None) -> str:
-    return " | ".join(norm_text(p, prefixes=prefixes) for p in parts if norm_text(p, prefixes=prefixes))
+    return _join_key(*(norm_text(part, prefixes=prefixes) for part in parts))
 
 
 def clean_header(value) -> str:
@@ -2550,13 +1866,7 @@ def clean_header(value) -> str:
 
 
 def best_fuzzy_match(query_key: str, choices: list[str]):
-    """
-    Bounded fuzzy matching.
-
-    The old fallback compared a failed query against every approval key,
-    which could block the Streamlit app for a long time. We only score a
-    small shortlist now.
-    """
+    """Keep the original five-candidate shortlist, score and threshold."""
     if not query_key or not choices:
         return None, 0.0
 
@@ -2590,9 +1900,6 @@ def best_fuzzy_match(query_key: str, choices: list[str]):
     return None, best_score
 
 
-# ============================================================
-# Workbook helpers
-# ============================================================
 def get_sheet_by_names(wb, possible_names):
     name_map = {name.strip().upper(): name for name in wb.sheetnames}
     for wanted in possible_names:
@@ -2603,50 +1910,21 @@ def get_sheet_by_names(wb, possible_names):
 
 
 def find_header_row_and_columns(ws, wanted_headers, max_scan_rows=20):
-    wanted_clean = {canonical: [clean_header(x) for x in aliases] for canonical, aliases in wanted_headers.items()}
-
-    for r in range(1, min(ws.max_row, max_scan_rows) + 1):
-        row_map = {}
-        for c in range(1, ws.max_column + 1):
-            cell_clean = clean_header(ws.cell(r, c).value)
-            if not cell_clean:
+    aliases = {key: {clean_header(item) for item in names} for key, names in wanted_headers.items()}
+    required = set(wanted_headers) - {"Status"}
+    limit = min(max_scan_rows, ws.max_row or max_scan_rows)
+    for r, row in enumerate(ws.iter_rows(max_row=limit, values_only=True), 1):
+        columns = {}
+        for c, value in enumerate(row, 1):
+            if value is None:
                 continue
-            for canonical, aliases in wanted_clean.items():
-                if cell_clean in aliases:
-                    row_map[canonical] = c
-
-        required = [k for k in wanted_headers if k != "Status"]
-        if all(k in row_map for k in required):
-            return r, row_map
-
+            header = clean_header(value)
+            for key, options in aliases.items():
+                if header and header in options:
+                    columns[key] = c
+        if required.issubset(columns):
+            return r, columns
     return None, {}
-
-
-def copy_cell_style(src, dst):
-    if src is None or dst is None:
-        return
-    dst.font = copy(src.font)
-    dst.fill = copy(src.fill)
-    dst.border = copy(src.border)
-    dst.alignment = copy(src.alignment)
-    dst.number_format = src.number_format
-    dst.protection = copy(src.protection)
-
-
-def safe_float(value):
-    if value is None:
-        return 0.0
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        s = value.strip().replace(",", "")
-        if not s:
-            return 0.0
-        try:
-            return float(s)
-        except Exception:
-            return 0.0
-    return 0.0
 
 
 def status_fill(status):
@@ -2677,6 +1955,8 @@ def _shift_merge_range_for_insert(range_string: str, insert_col: int) -> str:
 
 def _insert_column_preserve_merges(ws, insert_col: int):
     """openpyxl does not reliably shift merged ranges on insert_cols; do it manually."""
+    if insert_col > ws.max_column:
+        return  # An appended column cannot shift any cells or merges.
     merge_ranges = [str(mr) for mr in ws.merged_cells.ranges]
     for rng in merge_ranges:
         ws.unmerge_cells(rng)
@@ -2751,128 +2031,63 @@ def get_or_insert_status_column(ws, header_row, description_col=None):
     return status_col, True
 
 
-# ============================================================
-# Approval index
-# ============================================================
 def read_approval_rows(approval_file):
-    raw = BytesIO(approval_file.getvalue())
-    wb = load_workbook(raw, data_only=True)
-
     rows = []
     prefixes = set(BASE_GENERATED_PREFIXES)
-
-    # ---------- UNOPS approval sheet ----------
-    ws_unops = get_sheet_by_names(wb, APPROVAL_SHEETS["UNOPS"])
-    if ws_unops is not None:
-        headers = {
-            "Cluster": ["Cluster"],
-            "Agency": ["AGENCY", "Agency"],
-            "Description": ["DESCRIPTION", "Description"],
-            "Status": [STATUS_COL_NAME, "Status"],
-        }
-        header_row, cols = find_header_row_and_columns(ws_unops, headers)
-        if header_row:
-            for r in range(header_row + 1, ws_unops.max_row + 1):
-                cluster = ws_unops.cell(r, cols.get("Cluster", 0)).value if cols.get("Cluster") else None
-                agency = ws_unops.cell(r, cols.get("Agency", 0)).value if cols.get("Agency") else None
-                desc = ws_unops.cell(r, cols.get("Description", 0)).value if cols.get("Description") else None
-                status = ws_unops.cell(r, cols.get("Status", 0)).value if cols.get("Status") else None
-                if not any([cluster, agency, desc, status]):
+    with closing(load_workbook(BytesIO(approval_file.getvalue()), read_only=True, data_only=True, keep_links=False)) as wb:
+        for org, names in APPROVAL_SHEETS.items():
+            ws = get_sheet_by_names(wb, names)
+            if ws is None:
+                continue
+            # Some Excel writers omit the used range or record it as A1.
+            ws.reset_dimensions()
+            category = "Cluster" if org == "UNOPS" else "Intervention"
+            headers = {category: [category], "Description": ["Description"], "Status": [STATUS_COL_NAME, "Status"]}
+            if org == "UNOPS":
+                headers["Agency"] = ["Agency"]
+            header_row, cols = find_header_row_and_columns(ws, headers)
+            if header_row is None:
+                continue
+            data = ws.iter_rows(min_row=header_row + 1, max_col=max(cols.values()), values_only=True)
+            for r, values in enumerate(data, header_row + 1):
+                cluster = values[cols[category] - 1]
+                agency = values[cols["Agency"] - 1] if "Agency" in cols else None
+                desc = values[cols["Description"] - 1]
+                status = values[cols["Status"] - 1] if "Status" in cols else None
+                if not any((cluster, agency, desc, status)):
                     continue
-
                 prefixes.add(str(cluster).strip())
                 rows.append({
-                    "Source Org": "UNOPS",
-                    "Approved Cluster/Intervention": cluster,
-                    "Approved Agency": agency,
-                    "Approved Description": desc,
-                    "Review Status": status or "Unknown",
-                    "Approval Sheet Row": r,
+                    "Source Org": org, "Approved Cluster/Intervention": cluster,
+                    "Approved Agency": agency, "Approved Description": desc,
+                    "Review Status": status or "Unknown", "Approval Sheet Row": r,
                 })
-
-    # ---------- WFP approval sheet ----------
-    ws_wfp = get_sheet_by_names(wb, APPROVAL_SHEETS["WFP"])
-    if ws_wfp is not None:
-        headers = {
-            "Intervention": ["INTERVENTION", "Intervention"],
-            "Description": ["DESCRIPTION", "Description"],
-            "Status": [STATUS_COL_NAME, "Status"],
-        }
-        header_row, cols = find_header_row_and_columns(ws_wfp, headers)
-        if header_row:
-            for r in range(header_row + 1, ws_wfp.max_row + 1):
-                intervention = ws_wfp.cell(r, cols.get("Intervention", 0)).value if cols.get("Intervention") else None
-                desc = ws_wfp.cell(r, cols.get("Description", 0)).value if cols.get("Description") else None
-                status = ws_wfp.cell(r, cols.get("Status", 0)).value if cols.get("Status") else None
-                if not any([intervention, desc, status]):
-                    continue
-
-                prefixes.add(str(intervention).strip())
-                rows.append({
-                    "Source Org": "WFP",
-                    "Approved Cluster/Intervention": intervention,
-                    "Approved Agency": None,
-                    "Approved Description": desc,
-                    "Review Status": status or "Unknown",
-                    "Approval Sheet Row": r,
-                })
-
     if not rows:
         raise RuntimeError("No approval rows were found in the approval workbook.")
-
     return rows, prefixes
 
 
 def build_approval_index(approval_file):
-    approval_rows, prefixes = read_approval_rows(approval_file)
-
-    index = {
-        "UNOPS": {
-            "exact": {},
-            "choices": [],
-            "fuzzy_cache": {},
-        },
-        "WFP": {
-            "exact": {},
-            "choices": [],
-            "fuzzy_cache": {},
-        },
-    }
-
-    for row in approval_rows:
+    rows, prefixes = read_approval_rows(approval_file)
+    rules = frozenset(prefixes)
+    index = {org: {"exact": {}, "choices": [], "fuzzy_cache": {}} for org in APPROVAL_SHEETS}
+    for row in rows:
         org = row["Source Org"]
-        cluster = row["Approved Cluster/Intervention"]
-        agency = row["Approved Agency"]
-        desc = row["Approved Description"]
-
+        cluster = norm_text(row["Approved Cluster/Intervention"], rules)
+        desc = norm_text(row["Approved Description"], rules)
         if org == "UNOPS":
-            keys = {
-                compact_key(agency, desc, prefixes=prefixes),
-                compact_key(agency, prefixes=prefixes),
-                compact_key(desc, prefixes=prefixes),
-                compact_key(cluster, agency, prefixes=prefixes),
-                compact_key(cluster, agency, desc, prefixes=prefixes),
-            }
+            agency = norm_text(row["Approved Agency"], rules)
+            keys = {_join_key(agency, desc), agency, desc, _join_key(cluster, agency), _join_key(cluster, agency, desc)}
         else:
-            keys = {
-                compact_key(cluster, desc, prefixes=prefixes),
-                compact_key(desc, prefixes=prefixes),
-                compact_key(cluster, prefixes=prefixes),
-            }
-
+            keys = {_join_key(cluster, desc), desc, cluster}
         for key in keys:
             if key:
                 index[org]["exact"].setdefault(key, row)
-
-    for org in ("UNOPS", "WFP"):
-        index[org]["choices"] = list(index[org]["exact"].keys())
-
-    return index, prefixes, pd.DataFrame(approval_rows)
+    for group in index.values():
+        group["choices"] = list(group["exact"])
+    return index, prefixes, pd.DataFrame(rows)
 
 
-# ============================================================
-# Distribution Summary comparison
-# ============================================================
 def detect_row_source_org(cluster_value) -> str:
     # In the final Fuels Summary workbook, WFP rows have Cluster = WFP.
     return "WFP" if norm_text(cluster_value) == "WFP" else "UNOPS"
@@ -2902,24 +2117,17 @@ def review_summary_row(cluster, agency, desc, approval_index, prefixes):
     choices = approval_index[org]["choices"]
     fuzzy_cache = approval_index[org]["fuzzy_cache"]
 
-    cleaned_agency = strip_generated_prefix(agency, prefixes=prefixes)
-
+    rules = frozenset(prefixes or BASE_GENERATED_PREFIXES)
+    agency_key = norm_text(agency, rules)
+    desc_key = norm_text(desc, rules)
+    full = _join_key(agency_key, desc_key)
     if org == "WFP":
-        candidate_keys = [
-            compact_key(agency, desc, prefixes=prefixes),
-            compact_key(cleaned_agency, desc, prefixes=prefixes),
-            compact_key(desc, prefixes=prefixes),
-            compact_key(cleaned_agency, prefixes=prefixes),
-        ]
+        candidates = [full, desc_key, agency_key]
     else:
-        candidate_keys = [
-            compact_key(agency, desc, prefixes=prefixes),
-            compact_key(cleaned_agency, desc, prefixes=prefixes),
-            compact_key(cleaned_agency, prefixes=prefixes),
-            compact_key(desc, prefixes=prefixes),
-            compact_key(cluster, cleaned_agency, prefixes=prefixes),
-            compact_key(cluster, cleaned_agency, desc, prefixes=prefixes),
-        ]
+        cluster_key = norm_text(cluster, rules)
+        candidates = [full, agency_key, desc_key, _join_key(cluster_key, agency_key),
+                      _join_key(cluster_key, agency_key, desc_key)]
+    candidate_keys = list(dict.fromkeys(candidates))
 
     for key in candidate_keys:
         if key and key in exact:
@@ -2984,11 +2192,9 @@ def review_summary_row(cluster, agency, desc, approval_index, prefixes):
     }
 
 
+# Final worksheet formatting
 
 
-# ============================================================
-# Final workbook formatting helpers
-# ============================================================
 def _has_hebrew(value) -> bool:
     if value is None:
         return False
@@ -3107,104 +2313,46 @@ def _row_has_any_real_value(ws, row_num, max_col=None):
 
 
 def remerge_total_sum_per_category(ws, header_row=1):
-    """Rebuild the Total Sum Per Category merges without touching other columns.
-
-    This is run at the very end because column deletion/style operations can
-    disturb merged ranges. The values are recalculated from row-level Unified
-    Fuel, then Total Sum Per Category is merged only by consecutive Cluster
-    groups.
-    """
-    total_col = _find_header_col_exact(ws, "Total Sum Per Category", header_row=header_row)
+    """Rebuild consecutive category merges from row-level Unified Fuel."""
+    total_col = _find_header_col_exact(ws, "Total Sum Per Category", header_row)
     if total_col is None:
         return
-
-    cluster_col = _find_header_col_exact(ws, "Cluster", header_row=header_row)
-    if cluster_col is None:
-        cluster_col = _find_header_col_exact(ws, "INTERVENTION", header_row=header_row)
-    if cluster_col is None:
-        cluster_col = 1
-
-    unified_col = _find_header_col_exact(ws, "Unified Fuel", header_row=header_row)
-
-    # Unmerge only ranges intersecting Total Sum Per Category, preserving values/styles.
-    for mr in list(ws.merged_cells.ranges):
-        if mr.min_col <= total_col <= mr.max_col and mr.max_row > header_row:
-            top = ws.cell(mr.min_row, total_col)
-            top_value = top.value
-            top_style = copy(top._style)
-            top_font = copy(top.font)
-            top_alignment = copy(top.alignment)
-            top_number_format = top.number_format
-            top_protection = copy(top.protection)
-            top_fill = copy(top.fill)
-            ws.unmerge_cells(str(mr))
-            for r in range(mr.min_row, mr.max_row + 1):
+    cluster_col = (_find_header_col_exact(ws, "Cluster", header_row)
+                   or _find_header_col_exact(ws, "INTERVENTION", header_row) or 1)
+    fuel_col = _find_header_col_exact(ws, "Unified Fuel", header_row)
+    last, width = ws.max_row, ws.max_column
+    for merged in list(ws.merged_cells.ranges):
+        if merged.min_col <= total_col <= merged.max_col and merged.max_row > header_row:
+            anchor = ws.cell(merged.min_row, total_col)
+            value, style = anchor.value, copy(anchor._style)
+            ws.unmerge_cells(str(merged))
+            for r in range(merged.min_row, merged.max_row + 1):
                 cell = _ensure_real_cell(ws, r, total_col)
-                cell.value = top_value
-                cell._style = copy(top_style)
-                cell.font = copy(top_font)
-                cell.alignment = copy(top_alignment)
-                cell.number_format = top_number_format
-                cell.protection = copy(top_protection)
-                cell.fill = copy(top_fill)
+                cell.value = value
+                cell._style = copy(style)
 
-    # Recalculate total per cluster from the reliable row-level Unified Fuel column.
-    if unified_col is not None:
+    if fuel_col is not None:
         totals = {}
-        for r in range(header_row + 1, ws.max_row + 1):
-            if not _row_has_any_real_value(ws, r, max_col=ws.max_column):
-                continue
-            key = "" if ws.cell(r, cluster_col).value is None else str(ws.cell(r, cluster_col).value).strip()
-            totals[key] = totals.get(key, 0.0) + safe_float(ws.cell(r, unified_col).value)
-
-        for r in range(header_row + 1, ws.max_row + 1):
-            key = "" if ws.cell(r, cluster_col).value is None else str(ws.cell(r, cluster_col).value).strip()
+        for r in range(header_row + 1, last + 1):
+            if _row_has_any_real_value(ws, r, width):
+                key = _label(ws.cell(r, cluster_col).value)
+                totals[key] = totals.get(key, 0.0) + safe_float(ws.cell(r, fuel_col).value)
+        for r in range(header_row + 1, last + 1):
+            key = _label(ws.cell(r, cluster_col).value)
             if key in totals:
-                target = _ensure_real_cell(ws, r, total_col)
-                target.value = totals[key]
+                _ensure_real_cell(ws, r, total_col).value = totals[key]
 
-    # Rebuild merges by consecutive cluster groups.
-    r = header_row + 1
-    while r <= ws.max_row:
-        if not _row_has_any_real_value(ws, r, max_col=ws.max_column):
-            r += 1
-            continue
-
-        key = "" if ws.cell(r, cluster_col).value is None else str(ws.cell(r, cluster_col).value).strip().upper()
-        start = r
-        end = r
-        rr = r + 1
-        while rr <= ws.max_row:
-            if not _row_has_any_real_value(ws, rr, max_col=ws.max_column):
-                break
-            next_key = "" if ws.cell(rr, cluster_col).value is None else str(ws.cell(rr, cluster_col).value).strip().upper()
-            if next_key != key:
-                break
-            end = rr
-            rr += 1
-
-        top = ws.cell(start, total_col)
-        top_value = top.value
-        top_style = copy(top._style)
-        top_font = copy(top.font)
-        top_alignment = copy(top.alignment)
-        top_number_format = top.number_format
-        top_protection = copy(top.protection)
-        top_fill = copy(top.fill)
-
-        if end > start:
-            ws.merge_cells(start_row=start, start_column=total_col, end_row=end, end_column=total_col)
-
-        top = ws.cell(start, total_col)
-        top.value = top_value
-        top._style = copy(top_style)
-        top.font = copy(top_font)
-        top.alignment = copy(top_alignment)
-        top.number_format = top_number_format
-        top.protection = copy(top_protection)
-        top.fill = copy(top_fill)
-
-        r = end + 1
+    first = None
+    previous = None
+    for r in range(header_row + 1, last + 2):
+        populated = r <= last and _row_has_any_real_value(ws, r, width)
+        category = _label(ws.cell(r, cluster_col).value).upper() if populated else None
+        if first is not None and category != previous:
+            _merge_column_group(ws, total_col, first, r - 1)
+            first = None
+        if first is None and populated:
+            first = r
+        previous = category
 
 
 def style_distribution_summary_final(ws):
@@ -3217,6 +2365,7 @@ def style_distribution_summary_final(ws):
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
     total_cat_col = _find_header_col_exact(ws, "Total Sum Per Category", header_row=1)
 
+    fonts = {}
     for row in ws.iter_rows():
         for cell in row:
             if isinstance(cell, MergedCell):
@@ -3227,14 +2376,20 @@ def style_distribution_summary_final(ws):
                 continue
 
             cell.alignment = center
-            font_color = "FFFFFF" if cell.row == 1 else "000000"
-            cell.font = _font_with(cell, name="Calibri", size=11, color=font_color, bold=False if cell.row != 1 else True, italic=False)
+            is_header = cell.row == 1
+            font_key = (cell._style.fontId, is_header)
+            if font_key not in fonts:
+                fonts[font_key] = _font_with(cell, name="Calibri", size=11,
+                                             color="FFFFFF" if is_header else "000000",
+                                             bold=is_header, italic=False)
+            cell.font = fonts[font_key]
 
             # Apply all borders only outside Total Sum Per Category.
             if total_cat_col is None or cell.column != total_cat_col:
                 cell.border = border
 
     _set_autofilter_to_real_headers(ws, header_row=1)
+
 
 def style_sector_summary_final(ws):
     """Final requested styling for Sector Summary."""
@@ -3273,9 +2428,11 @@ def style_fuel_dashboard_final(ws):
     """Final requested styling for Fuel Dashboard."""
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
+    width = ws.max_column
+
     # Top table A1:D4 -> Aduma 16 for Hebrew/numbers, no bold.
     for r in range(1, min(ws.max_row, 4) + 1):
-        for c in range(1, min(ws.max_column, 4) + 1):
+        for c in range(1, min(width, 4) + 1):
             cell = ws.cell(r, c)
             cell.alignment = center
             if _has_hebrew(cell.value) or _is_number_like(cell.value):
@@ -3285,7 +2442,7 @@ def style_fuel_dashboard_final(ws):
 
     # Bottom tables from row 7 down -> size 12, Aduma for Hebrew/numbers.
     for r in range(7, ws.max_row + 1):
-        for c in range(1, ws.max_column + 1):
+        for c in range(1, width + 1):
             cell = ws.cell(r, c)
             cell.alignment = center
             if _has_hebrew(cell.value) or _is_number_like(cell.value):
@@ -3304,6 +2461,7 @@ def style_status_dashboard_final(ws):
                 cell.font = _font_with(cell, name="Aduma", size=12, bold=False, italic=False)
             elif cell.value is not None:
                 cell.font = _font_with(cell, size=12, bold=False, italic=False)
+
 
 def move_sheet_before(wb, sheet_name, before_sheet_name):
     if sheet_name not in wb.sheetnames or before_sheet_name not in wb.sheetnames:
@@ -3325,9 +2483,10 @@ def apply_final_workbook_layout(wb):
     if "סטטוס לפי אישורים" in wb.sheetnames:
         style_status_dashboard_final(wb["סטטוס לפי אישורים"])
 
-# ============================================================
-# Status Dashboard sheet
-# ============================================================
+
+# Hebrew approval status dashboard
+
+
 def _text_contains(value, *needles) -> bool:
     txt = "" if value is None else str(value).strip().upper()
     return any(str(n).strip().upper() in txt for n in needles if n)
@@ -3372,7 +2531,6 @@ def _unified_fuel_column_has_bad_merges(ws, fuel_col, header_row=1):
 def _dashboard_category(cluster, agency, status):
     """Map each reviewed row into the requested Hebrew dashboard buckets."""
     c = _normalised_cluster(cluster)
-    a = norm_text(agency)
     s = "" if status is None else str(status).strip()
     su = s.upper()
 
@@ -3430,21 +2588,15 @@ def _write_dashboard_row(ws, row, sector, detail, amount, total, fill_hex, font_
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=2)
         c = ws.cell(row, 1)
         c.value = detail
-        for col in (1, 2):
-            cell = ws.cell(row, col)
-            cell.fill = fill
-            cell.font = Font(color=font_hex, bold=True, size=12)
-            cell.alignment = center
-            cell.border = border
     else:
         ws.cell(row, 1).value = sector
         ws.cell(row, 2).value = detail
-        for col in (1, 2):
-            cell = ws.cell(row, col)
-            cell.fill = fill
-            cell.font = Font(color=font_hex, bold=True, size=12)
-            cell.alignment = center
-            cell.border = border
+    for col in (1, 2):
+        cell = ws.cell(row, col)
+        cell.fill = fill
+        cell.font = Font(color=font_hex, bold=True, size=12)
+        cell.alignment = center
+        cell.border = border
 
     qty_cell = ws.cell(row, 3)
     pct_cell = ws.cell(row, 4)
@@ -3515,7 +2667,7 @@ def add_status_dashboard_sheet(wb, source_ws, header_row=1, sheet_name="סטטו
     ws = wb.create_sheet(sheet_name)
     ws.sheet_view.rightToLeft = False
 
-    # Main table structure matching the requested screenshot.
+    # Fixed row order of the Hebrew dashboard.
     headers = ["סקטור", "פירוט", "כמות", "אחוז"]
     for c, h in enumerate(headers, start=1):
         cell = ws.cell(1, c)
@@ -3578,13 +2730,11 @@ def add_status_dashboard_sheet(wb, source_ws, header_row=1, sheet_name="סטטו
     for r in range(1, ws.max_row + 1):
         ws.row_dimensions[r].height = 28
 
-    # Keep this sheet clean: only the requested Hebrew summary table is created here.
-
     return sums, pd.DataFrame(source_rows)
 
-# ============================================================
-# Weekly Fuel Overview sheet
-# ============================================================
+
+# Weekly Fuel Overview
+
 
 FUEL_OVERVIEW_SHEET_NAME = "Fuel Overview"
 
@@ -3620,61 +2770,15 @@ def _overview_normalise_text(value) -> str:
     text = re.sub(r"\s+", " ", text)
     return text
 
+
 def _overview_status_is_included(value) -> bool:
-    """
-    Return True when the status should be included in the
-    red Fuel Overview calculation.
-
-    'מסורב' and 'מוקפא' are checked as contained words so that
-    combined statuses are included as well.
-    """
     status = _overview_normalise_text(value)
-
-    if status == "":
-        return False
-
-    if status == "ארגונים/גופים לא מוכרים (INGOs/חברות מקומיות)":
-        return True
-
-    # Includes:
-    # ארגון מסורב
-    # ארגון מסורב ומוקפא
-    # ארגון מסורב וסורב ספציפית
-    if "מסורב" in status:
-        return True
-
-    # Includes:
-    # ארגון מוקפא
-    # ארגון מסורב ומוקפא
-    if "מוקפא" in status:
-        return True
-
-    if status in {
-        'סוכנויות או"ם לא מפורטות (UN Sisters)',
-        'סוכנויות או"ם לא מוכרות (UN Sisters)',
-    }:
-        return True
-
-    if status == "ארגונים שותפים":
-        return True
-
-    return False
+    return status in FUEL_OVERVIEW_INCLUDED_STATUSES or "מסורב" in status or "מוקפא" in status
 
 
 def _overview_rounded_percentage(numerator, denominator):
-    """
-    Store the percentage already rounded to one decimal place,
-    rather than only hiding the additional decimals with formatting.
-    """
-    if not denominator:
-        return 0.0
+    return round(numerator / denominator * 100, 1) / 100 if denominator else 0.0
 
-    percentage_number = (numerator / denominator) * 100
-    rounded_percentage_number = round(percentage_number, 1)
-
-    # Excel percentages are stored as fractions:
-    # 24.9% is stored as 0.249.
-    return rounded_percentage_number / 100
 
 def _overview_litre_text(value):
     """
@@ -3684,6 +2788,7 @@ def _overview_litre_text(value):
     copying the cell will also copy the word ליטר.
     """
     return f'\u200fליטר {value:,.0f}'
+
 
 def _overview_find_header_column(ws, possible_names, header_row=1):
     """
@@ -3709,297 +2814,87 @@ def _overview_find_header_column(ws, possible_names, header_row=1):
 
 
 def _overview_get_used_fuel(ws_dashboard, organisation):
-    """
-    Read the value under דלק שנוצל for UNOPS or WFP
-    from the Fuel Dashboard summary table.
-    """
-    used_fuel_col = _overview_find_header_column(
-        ws_dashboard,
-        ["דלק שנוצל"],
-        header_row=1,
-    )
-
-    organisation_upper = organisation.upper()
-
-    # Search the small summary table at the top of Fuel Dashboard.
-    for r in range(2, min(ws_dashboard.max_row, 10) + 1):
-        organisation_found = False
-
-        for c in range(1, min(ws_dashboard.max_column, 10) + 1):
-            current_value = _overview_normalise_text(
-                ws_dashboard.cell(row=r, column=c).value
-            ).upper()
-
-            if current_value == organisation_upper:
-                organisation_found = True
-                break
-
-        if organisation_found:
-            return safe_float(
-                ws_dashboard.cell(
-                    row=r,
-                    column=used_fuel_col,
-                ).value
-            )
-
-    raise RuntimeError(
-        f'Could not find "{organisation}" in the '
-        f'Fuel Dashboard summary table.'
-    )
+    used_col = _overview_find_header_column(ws_dashboard, ["דלק שנוצל"])
+    top_rows = ws_dashboard.iter_rows(min_row=2, max_row=min(ws_dashboard.max_row, 10),
+                                       max_col=min(ws_dashboard.max_column, 10))
+    for row in top_rows:
+        if any(_overview_normalise_text(cell.value).upper() == organisation.upper() for cell in row):
+            return safe_float(ws_dashboard.cell(row[0].row, used_col).value)
+    raise RuntimeError(f'Could not find "{organisation}" in the Fuel Dashboard summary table.')
 
 
 def _calculate_fuel_overview_metrics(wb):
-    """
-    Calculate all values shown in the Fuel Overview sheet.
-    """
-    required_sheets = [
-        "Distribution Summary",
-        "Fuel Dashboard",
-    ]
+    required = [DISTRIBUTION_SHEET_NAME, "Fuel Dashboard"]
+    missing = [name for name in required if name not in wb.sheetnames]
+    if missing:
+        raise RuntimeError("Cannot create Fuel Overview. Missing sheets: " + ", ".join(missing))
 
-    missing_sheets = [
-        sheet_name
-        for sheet_name in required_sheets
-        if sheet_name not in wb.sheetnames
-    ]
+    summary, dashboard = (wb[name] for name in required)
+    cluster_col = _overview_find_header_column(summary, ["Cluster", "INTERVENTION"])
+    fuel_col = _overview_find_header_column(summary, ["Unified Fuel"])
+    status_col = _overview_find_header_column(summary, [STATUS_COL_NAME])
+    filtered = {"UNOPS": 0.0, "WFP": 0.0}
+    for row in summary.iter_rows(min_row=2, max_col=max(cluster_col, fuel_col, status_col), values_only=True):
+        if _overview_status_is_included(row[status_col - 1]):
+            cluster = _overview_normalise_text(row[cluster_col - 1]).upper()
+            org = "WFP" if cluster == "WFP" else "UNOPS"
+            filtered[org] += safe_float(row[fuel_col - 1])
 
-    if missing_sheets:
-        raise RuntimeError(
-            "Cannot create Fuel Overview. Missing sheets: "
-            + ", ".join(missing_sheets)
-        )
-
-    ws_distribution = wb["Distribution Summary"]
-    ws_dashboard = wb["Fuel Dashboard"]
-
-    cluster_col = _overview_find_header_column(
-        ws_distribution,
-        ["Cluster", "INTERVENTION"],
-    )
-
-    unified_fuel_col = _overview_find_header_column(
-        ws_distribution,
-        ["Unified Fuel"],
-    )
-
-    status_col = _overview_find_header_column(
-        ws_distribution,
-        ["סטטוס"],
-    )
-
-    unops_filtered_fuel = 0.0
-    wfp_filtered_fuel = 0.0
-
-    for r in range(2, ws_distribution.max_row + 1):
-        status_value = ws_distribution.cell(
-            row=r,
-            column=status_col,
-        ).value
-
-        # Include exact statuses and combined statuses that contain
-        # מסורב or מוקפא.
-        if not _overview_status_is_included(status_value):
-            continue
-
-        cluster_value = _overview_normalise_text(
-            ws_distribution.cell(
-                row=r,
-                column=cluster_col,
-            ).value
-        ).upper()
-
-        unified_fuel = safe_float(
-            ws_distribution.cell(
-                row=r,
-                column=unified_fuel_col,
-            ).value
-        )
-
-        if cluster_value == "WFP":
-            wfp_filtered_fuel += unified_fuel
-        else:
-            unops_filtered_fuel += unified_fuel
-
-    unops_used_fuel = _overview_get_used_fuel(
-        ws_dashboard,
-        "UNOPS",
-    )
-
-    wfp_used_fuel = _overview_get_used_fuel(
-        ws_dashboard,
-        "WFP",
-    )
-
-    total_used_fuel = unops_used_fuel + wfp_used_fuel
-
-    total_filtered_fuel = (
-        unops_filtered_fuel + wfp_filtered_fuel
-    )
-
-    return {
-        "unops_filtered_fuel": unops_filtered_fuel,
-        "wfp_filtered_fuel": wfp_filtered_fuel,
-
-        "unops_used_fuel": unops_used_fuel,
-        "wfp_used_fuel": wfp_used_fuel,
-
-         "unops_percentage": _overview_rounded_percentage(
-            unops_filtered_fuel,
-            unops_used_fuel,
-        ),
-
-        "wfp_percentage": _overview_rounded_percentage(
-            wfp_filtered_fuel,
-            wfp_used_fuel,
-        ),
-
-        "total_used_fuel": total_used_fuel,
-        "total_filtered_fuel": total_filtered_fuel,
-
-        "total_percentage": _overview_rounded_percentage(
-            total_filtered_fuel,
-            total_used_fuel,
-        ),
-    }
+    used = {org: _overview_get_used_fuel(dashboard, org) for org in filtered}
+    metrics = {}
+    for org in filtered:
+        key = org.lower()
+        metrics[f"{key}_filtered_fuel"] = filtered[org]
+        metrics[f"{key}_used_fuel"] = used[org]
+        metrics[f"{key}_percentage"] = _overview_rounded_percentage(filtered[org], used[org])
+    metrics["total_used_fuel"] = sum(used.values())
+    metrics["total_filtered_fuel"] = sum(filtered.values())
+    metrics["total_percentage"] = _overview_rounded_percentage(metrics["total_filtered_fuel"], metrics["total_used_fuel"])
+    return metrics
 
 
 def _overview_fill_background(ws, cell_range, fill_colour):
-    fill = PatternFill(
-        fill_type="solid",
-        fgColor=fill_colour,
-    )
-
-    min_col, min_row, max_col, max_row = range_boundaries(
-        cell_range
-    )
-
-    for row in range(min_row, max_row + 1):
-        for col in range(min_col, max_col + 1):
-            ws.cell(row=row, column=col).fill = fill
+    fill = PatternFill("solid", fgColor=fill_colour)
+    left, top, right, bottom = range_boundaries(cell_range)
+    for row in ws.iter_rows(min_row=top, max_row=bottom, min_col=left, max_col=right):
+        for cell in row:
+            cell.fill = fill
 
 
-def _overview_merge_text(
-    ws,
-    cell_range,
-    value,
-    font_size,
-    bold=True,
-    font_name="Arial",
-    font_colour="000000",
-):
-    min_col, min_row, max_col, max_row = range_boundaries(
-        cell_range
-    )
-
+def _overview_merge_text(ws, cell_range, value, font_size, bold=True, font_name="Arial", font_colour="000000"):
+    left, top, _, _ = range_boundaries(cell_range)
     ws.merge_cells(cell_range)
-
-    cell = ws.cell(
-        row=min_row,
-        column=min_col,
-    )
-
+    cell = ws.cell(top, left)
     cell.value = value
-    cell.font = Font(
-        name=font_name,
-        size=font_size,
-        bold=bold,
-        color=font_colour,
-    )
-    cell.alignment = Alignment(
-        horizontal="center",
-        vertical="center",
-        wrap_text=True,
-    )
-
+    cell.font = Font(name=font_name, size=font_size, bold=bold, color=font_colour)
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     return cell
 
-def _overview_create_box(
-    ws,
-    cell_range,
-    value,
-    fill_colour,
-    font_size,
-    bold=True,
-    number_format=None,
-    border_style="medium",
-    font_name="Arial",
-    font_colour="000000",
-    reading_order=0,
-):
-    """
-    Create a formatted merged-cell box.
 
-    reading_order:
-        0 = automatic
-        1 = left-to-right
-        2 = right-to-left
-    """
-    min_col, min_row, max_col, max_row = range_boundaries(
-        cell_range
-    )
-
-    fill = PatternFill(
-        fill_type="solid",
-        fgColor=fill_colour,
-    )
-
-    border_side = Side(
-        style=border_style,
-        color="000000",
-    )
-
-    empty_side = Side(style=None)
-
-    for row in range(min_row, max_row + 1):
-        for col in range(min_col, max_col + 1):
-            cell = ws.cell(row=row, column=col)
-
-            cell.fill = fill
-            cell.font = Font(
-                name=font_name,
-                size=font_size,
-                bold=bold,
-                color=font_colour,
-            )
-            cell.alignment = Alignment(
-                horizontal="center",
-                vertical="center",
-                wrap_text=True,
-                readingOrder=reading_order,
-            )
-
-            cell.border = Border(
-                left=border_side if col == min_col else empty_side,
-                right=border_side if col == max_col else empty_side,
-                top=border_side if row == min_row else empty_side,
-                bottom=border_side if row == max_row else empty_side,
-            )
-
+def _overview_create_box(ws, cell_range, value, fill_colour, font_size, bold=True,
+                         number_format=None, border_style="medium", font_name="Arial",
+                         font_colour="000000", reading_order=0):
+    """Draw a bordered, merged value box. Reading order 2 is right-to-left."""
+    left, top, right, bottom = range_boundaries(cell_range)
+    fill = PatternFill("solid", fgColor=fill_colour)
+    font = Font(name=font_name, size=font_size, bold=bold, color=font_colour)
+    alignment = Alignment(horizontal="center", vertical="center", wrap_text=True, readingOrder=reading_order)
+    edge, inside = Side(style=border_style, color="000000"), Side(style=None)
+    for row in ws.iter_rows(min_row=top, max_row=bottom, min_col=left, max_col=right):
+        for cell in row:
+            cell.fill, cell.font, cell.alignment = fill, font, alignment
+            cell.border = Border(left=edge if cell.column == left else inside,
+                                 right=edge if cell.column == right else inside,
+                                 top=edge if cell.row == top else inside,
+                                 bottom=edge if cell.row == bottom else inside)
     ws.merge_cells(cell_range)
-
-    top_left = ws.cell(
-        row=min_row,
-        column=min_col,
-    )
-
-    top_left.value = value
-    top_left.font = Font(
-        name=font_name,
-        size=font_size,
-        bold=bold,
-        color=font_colour,
-    )
-    top_left.alignment = Alignment(
-        horizontal="center",
-        vertical="center",
-        wrap_text=True,
-        readingOrder=reading_order,
-    )
-
+    anchor = ws.cell(top, left)
+    anchor.value = value
+    anchor.font, anchor.alignment = font, alignment
     if number_format:
-        top_left.number_format = number_format
+        anchor.number_format = number_format
+    return anchor
 
-    return top_left
 
 def add_fuel_overview_sheet(
     wb,
@@ -4031,7 +2926,7 @@ def add_fuel_overview_sheet(
     ws.page_margins.top = 0.25
     ws.page_margins.bottom = 0.25
 
-    # Colours matching the attached example.
+    # Fuel Overview colours.
     background_colour = "D9D9D9"
     red_colour = "F43D3D"
     yellow_colour = "FFB800"
@@ -4067,159 +2962,24 @@ def add_fuel_overview_sheet(
     for column_letter, width in column_widths.items():
         ws.column_dimensions[column_letter].width = width
 
-    # Default row heights.
-    for row in range(1, 28):
-        ws.row_dimensions[row].height = 20
+    for first, last, height in [
+        (1, 1, 8), (2, 3, 30), (4, 4, 8), (5, 7, 23), (8, 8, 8), (9, 11, 23),
+        (12, 12, 8), (13, 15, 27), (16, 17, 8), (18, 20, 23), (21, 22, 10),
+        (23, 26, 24), (27, 27, 20),
+    ]:
+        for r in range(first, last + 1):
+            ws.row_dimensions[r].height = height
 
-    ws.row_dimensions[1].height = 8
+    for org, title_range, left, right in (("wfp", "B2:F3", "C", "E"), ("unops", "J2:N3", "K", "M")):
+        _overview_merge_text(ws, title_range, org.upper(), font_size=30)
+        _overview_create_box(ws, f"{left}5:{right}7", _overview_litre_text(metrics[f"{org}_filtered_fuel"]),
+                             red_colour, 20, font_name="Aduma", reading_order=2)
+        _overview_create_box(ws, f"{left}8:{right}8", "", separator_colour, 1, border_style="thin")
+        _overview_create_box(ws, f"{left}9:{right}11", _overview_litre_text(metrics[f"{org}_used_fuel"]),
+                             yellow_colour, 20, font_name="Aduma", reading_order=2)
+        _overview_create_box(ws, f"{left}13:{right}15", metrics[f"{org}_percentage"],
+                             percentage_colour, 36, number_format="0.0%", border_style="thin", font_name="Aduma")
 
-    ws.row_dimensions[2].height = 30
-    ws.row_dimensions[3].height = 30
-
-    ws.row_dimensions[4].height = 8
-
-    for row in range(5, 8):
-        ws.row_dimensions[row].height = 23
-
-    ws.row_dimensions[8].height = 8
-
-    for row in range(9, 12):
-        ws.row_dimensions[row].height = 23
-
-    ws.row_dimensions[12].height = 8
-
-    for row in range(13, 16):
-        ws.row_dimensions[row].height = 27
-
-    ws.row_dimensions[16].height = 8
-    ws.row_dimensions[17].height = 8
-
-    for row in range(18, 21):
-        ws.row_dimensions[row].height = 23
-
-    ws.row_dimensions[21].height = 10
-    ws.row_dimensions[22].height = 10
-
-    for row in range(23, 27):
-        ws.row_dimensions[row].height = 24
-
-    # ========================================================
-    # Titles
-    # ========================================================
-
-    _overview_merge_text(
-        ws,
-        "B2:F3",
-        "WFP",
-        font_size=30,
-        bold=True,
-    )
-
-    _overview_merge_text(
-        ws,
-        "J2:N3",
-        "UNOPS",
-        font_size=30,
-        bold=True,
-    )
-
-    # ========================================================
-    # WFP section
-    # ========================================================
-
-    _overview_create_box(
-        ws,
-        "C5:E7",
-        _overview_litre_text(
-            metrics["wfp_filtered_fuel"]
-        ),
-        red_colour,
-        font_size=20,
-        font_name="Aduma",
-        reading_order=2,
-    )
-
-    _overview_create_box(
-        ws,
-        "C8:E8",
-        "",
-        separator_colour,
-        font_size=1,
-        border_style="thin",
-    )
-
-    _overview_create_box(
-        ws,
-        "C9:E11",
-        _overview_litre_text(
-            metrics["wfp_used_fuel"]
-        ),
-        yellow_colour,
-        font_size=20,
-        font_name="Aduma",
-        reading_order=2,
-    )
-
-    _overview_create_box(
-        ws,
-        "C13:E15",
-        metrics["wfp_percentage"],
-        percentage_colour,
-        font_size=36,
-        number_format="0.0%",
-        border_style="thin",
-        font_name="Aduma",
-    )
-
-    # ========================================================
-    # UNOPS section
-    # ========================================================
-
-    _overview_create_box(
-        ws,
-        "K5:M7",
-        _overview_litre_text(
-            metrics["unops_filtered_fuel"]
-        ),
-        red_colour,
-        font_size=20,
-        font_name="Aduma",
-        reading_order=2,
-    )
-
-    _overview_create_box(
-        ws,
-        "K8:M8",
-        "",
-        separator_colour,
-        font_size=1,
-        border_style="thin",
-    )
-
-    _overview_create_box(
-        ws,
-        "K9:M11",
-        _overview_litre_text(
-            metrics["unops_used_fuel"]
-        ),
-        yellow_colour,
-        font_size=20,
-        font_name="Aduma",
-        reading_order=2,
-    )
-
-    _overview_create_box(
-        ws,
-        "K13:M15",
-        metrics["unops_percentage"],
-        percentage_colour,
-        font_size=36,
-        number_format="0.0%",
-        border_style="thin",
-        font_name="Aduma",
-    )
-
-    # ========================================================
     # Explanation boxes
     # ========================================================
 
@@ -4294,12 +3054,14 @@ def add_fuel_overview_sheet(
 
     return ws
 
-def add_status_to_fuels_summary_workbook(fuels_summary_file, approval_index, prefixes, include_match_details=False):
-    raw = BytesIO(fuels_summary_file.getvalue())
-    wb = load_workbook(raw)
 
+# Report assembly and compatibility entry points
+
+
+def apply_approval_status(wb, approval_index, prefixes, include_match_details=False, source_name="workbook"):
+    """Add row-level approval statuses and the final dashboards to the live workbook."""
     if DISTRIBUTION_SHEET_NAME not in wb.sheetnames:
-        raise RuntimeError(f'Could not find sheet "{DISTRIBUTION_SHEET_NAME}" in {fuels_summary_file.name}.')
+        raise RuntimeError(f'Could not find sheet "{DISTRIBUTION_SHEET_NAME}" in {source_name}.')
 
     ws = wb[DISTRIBUTION_SHEET_NAME]
     headers = {
@@ -4311,7 +3073,7 @@ def add_status_to_fuels_summary_workbook(fuels_summary_file, approval_index, pre
     if not header_row:
         raise RuntimeError('Could not find Cluster / AGENCY / DESCRIPTION headers in Distribution Summary.')
 
-    status_col, inserted = get_or_insert_status_column(ws, header_row, cols["Description"])
+    status_col, _ = get_or_insert_status_column(ws, header_row, cols["Description"])
 
     detail_headers = ["Match Type", "Match Score", "Matched Cluster/Intervention", "Matched Agency", "Matched Description", "Approval Sheet Row"]
     detail_cols = {}
@@ -4326,6 +3088,10 @@ def add_status_to_fuels_summary_workbook(fuels_summary_file, approval_index, pre
             ws.column_dimensions[get_column_letter(c)].width = 24
 
     review_rows = []
+    prefixes = frozenset(prefixes or BASE_GENERATED_PREFIXES)
+    centre = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    status_font = Font(bold=True, color="000000")
+    status_fills = {}
     for r in range(header_row + 1, ws.max_row + 1):
         cluster = ws.cell(r, cols["Cluster"]).value
         agency = ws.cell(r, cols["Agency"]).value
@@ -4339,9 +3105,12 @@ def add_status_to_fuels_summary_workbook(fuels_summary_file, approval_index, pre
 
         # Use the row's existing style, then color only the status cell for easy review.
         copy_cell_style(ws.cell(r, cols["Description"]), status_cell)
-        status_cell.fill = status_fill(review["Review Status"])
-        status_cell.font = Font(bold=True, color="000000")
-        status_cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        label = review["Review Status"]
+        if label not in status_fills:
+            status_fills[label] = status_fill(label)
+        status_cell.fill = status_fills[label]
+        status_cell.font = status_font
+        status_cell.alignment = centre
 
         if include_match_details:
             for h in detail_headers:
@@ -4373,8 +3142,7 @@ def add_status_to_fuels_summary_workbook(fuels_summary_file, approval_index, pre
     header_cell.font = Font(color="FFFFFF", bold=True)
     header_cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    # Status Review Log removed per final request.
-    # Keep Distribution Summary usable, but filter only real header columns.
+    # The filter should cover only columns with real headers.
     ws.freeze_panes = "A2"
     _set_autofilter_to_real_headers(ws, header_row=header_row)
 
@@ -4382,7 +3150,7 @@ def add_status_to_fuels_summary_workbook(fuels_summary_file, approval_index, pre
     # BEFORE deleting helper columns.
     add_status_dashboard_sheet(wb, ws, header_row=header_row)
 
-        # Remove internal helper columns from the final Distribution Summary.
+    # Remove internal helper columns from the final Distribution Summary.
     _delete_columns_by_headers(
         ws,
         header_row,
@@ -4409,28 +3177,57 @@ def add_status_to_fuels_summary_workbook(fuels_summary_file, approval_index, pre
     # Apply the existing final workbook formatting.
     apply_final_workbook_layout(wb)
 
-    # Move Fuel Overview to the rightmost position,
-    # after סטטוס לפי אישורים.
     if FUEL_OVERVIEW_SHEET_NAME in wb.sheetnames:
-        overview_sheet = wb[FUEL_OVERVIEW_SHEET_NAME]
+        overview = wb[FUEL_OVERVIEW_SHEET_NAME]
+        wb.move_sheet(overview, offset=len(wb.sheetnames) - 1 - wb.index(overview))
 
-        wb._sheets.remove(overview_sheet)
-        wb._sheets.append(overview_sheet)
-
-    out = BytesIO()
-    wb.save(out)
-    wb.close()
-    out.seek(0)
-    gc.collect()
-
-    return out, pd.DataFrame(review_rows)
+    return pd.DataFrame(review_rows)
 
 
-# ============================================================
-# Persistent approval workbook helper
-# ============================================================
-APPROVAL_FILE_NAME = "חלוקת דלקים לארגונים מאושרים, מסורבים ומוקפאים.xlsx"
-APPROVAL_STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), APPROVAL_FILE_NAME) if "__file__" in globals() else APPROVAL_FILE_NAME
+def add_status_to_fuels_summary_workbook(fuels_summary_file, approval_index, prefixes, include_match_details=False):
+    with closing(load_workbook(BytesIO(fuels_summary_file.getvalue()))) as workbook:
+        review = apply_approval_status(workbook, approval_index, prefixes, include_match_details,
+                                       source_name=fuels_summary_file.name)
+        return workbook_bytes(workbook), review
+
+
+def generate_report(uploads, latest_day_uploads, selected_dates, approval_source,
+                    progress=None, status=None, include_match_details=False):
+    """Run the complete report and return (Excel buffer, row-level review, dashboard log)."""
+    if approval_source is None:
+        raise RuntimeError(f"Approval/status workbook was not found next to the app file: {APPROVAL_FILE_NAME}")
+    if latest_day_uploads and not selected_dates:
+        raise RuntimeError("Please select valid week start and end dates for the Fuel Dashboard.")
+
+    def step(percent, message):
+        if progress is not None:
+            progress.progress(percent)
+        if status is not None:
+            status.info(message)
+
+    logs = []
+    step(5, "Step 1/4: Combining Total Distribution files…")
+    with closing(build_combined_workbook(uploads, status)) as workbook:
+        step(25, "Step 2/4: Running Fuels Cleaner calculations…")
+        _prepare_excel_values(workbook[DISTRIBUTION_SHEET_NAME])
+        calculate_distribution(workbook, status=status)
+        if latest_day_uploads:
+            step(80, "Step 3/4: Adding Fuel Dashboard sheet…")
+            add_fuel_dashboard_sheet(workbook, latest_day_uploads, selected_dates, logs)
+        elif status is not None:
+            status.warning("No latest-day UNOPS/WFP files uploaded, so Fuel Dashboard was not added.")
+
+        step(90, "Step 4/4: Adding approval status review and סטטוס לפי אישורים sheet…")
+        for sheet in workbook:
+            _prepare_excel_values(sheet)
+        index, prefixes, _ = build_approval_index(approval_source)
+        review = apply_approval_status(workbook, index, prefixes, include_match_details)
+        step(98, "Writing the downloadable Excel file…")
+        output = workbook_bytes(workbook)
+    if progress is not None:
+        progress.progress(100)
+    return output, review, logs
+
 
 class LocalWorkbookFile:
     def __init__(self, path):
@@ -4442,6 +3239,7 @@ class LocalWorkbookFile:
         with open(self.path, "rb") as f:
             return f.read()
 
+
 class BytesWorkbookFile:
     def __init__(self, name, data):
         self.name = name
@@ -4451,10 +3249,12 @@ class BytesWorkbookFile:
     def getvalue(self):
         return self._data
 
+
 def get_saved_approval_file():
     if os.path.exists(APPROVAL_STORE_PATH):
         return LocalWorkbookFile(APPROVAL_STORE_PATH)
     return None
+
 
 def save_uploaded_approval_file(uploaded_file):
     with open(APPROVAL_STORE_PATH, "wb") as f:
@@ -4462,44 +3262,101 @@ def save_uploaded_approval_file(uploaded_file):
     return LocalWorkbookFile(APPROVAL_STORE_PATH)
 
 
-# ============================================================
-# UI: Upload → combine/calculations → add Fuel Dashboard → download
-# ============================================================
+# Streamlit interface
 
-left, right = st.columns([2, 1])
 
-with left:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
+def _reset_cached_output(state=None):
+    if state is None:
+        import streamlit as st
+        state = st.session_state
+    for key in ("final_bytes", "final_name", "debug_logs", "status_review_summary", "last_upload_key"):
+        state.pop(key, None)
 
-    saved_approval = get_saved_approval_file()
-    if saved_approval is not None:
-        st.caption(f"Using local approval workbook: {saved_approval.name}")
-    else:
-        st.warning(f"Approval workbook was not found next to the app file: {APPROVAL_FILE_NAME}")
 
-    uploads = st.file_uploader(
-        "Upload Total Distribution .xlsx files",
-        type=["xlsx"],
-        accept_multiple_files=True,
-        key="distribution_uploads",
-    )
-    latest_day_uploads = st.file_uploader(
-        "Upload latest-day UNOPS + WFP files for Fuel Dashboard",
-        type=["xlsx"],
-        accept_multiple_files=True,
-        key="latest_day_uploads",
-    )
-    st.markdown(
-        '<div class="small">The app reads the approval workbook directly from the code folder. The final workbook will include Distribution Summary, Sector Summary, Fuel Dashboard, and סטטוס לפי אישורים.</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
+def _upload_identity(upload):
+    # Streamlit identifies the actual upload, even if a replacement has the same name and size.
+    identifier = getattr(upload, "file_id", None)
+    if identifier is None:
+        identifier = hashlib.sha256(upload.getvalue()).hexdigest()
+    return upload.name, upload.size, identifier
 
-with right:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("**Pipeline**")
+
+def _show_download(st):
+    state = st.session_state
+    if state.get("status_review_summary"):
+        with st.expander("Status review summary"):
+            st.dataframe(pd.DataFrame(state.status_review_summary), use_container_width=True)
+    if state.get("debug_logs"):
+        with st.expander("Fuel Dashboard debug logs"):
+            st.text("\n".join(state.debug_logs))
+    st.download_button("Download final Excel", data=state.final_bytes, file_name=state.final_name,
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       use_container_width=True)
+
+
+def main():
+    import streamlit as st
+
+    st.set_page_config(page_title="Total Distribution → Calculations", layout="centered")
+
     st.markdown(
         """
+<style>
+    .block-container { padding-top: 2rem; max-width: 900px; }
+    .title { font-size: 2rem; font-weight: 800; margin-bottom: .25rem; }
+    .subtitle { color: #6b7280; margin-bottom: 1.25rem; }
+    .card {
+        border: 1px solid rgba(0,0,0,.08);
+        border-radius: 16px;
+        padding: 16px 18px;
+        background: rgba(255,255,255,.6);
+    }
+    .small { font-size: .9rem; color: #6b7280; }
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="title">Total Distribution Combiner + Fuels Cleaner</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="subtitle">Upload multiple Total Distribution files → combine first → then run your calculations → download final.</div>',
+        unsafe_allow_html=True,
+    )
+
+    left, right = st.columns([2, 1])
+
+    with left:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+
+        saved_approval = get_saved_approval_file()
+        if saved_approval is not None:
+            st.caption(f"Using local approval workbook: {saved_approval.name}")
+        else:
+            st.warning(f"Approval workbook was not found next to the app file: {APPROVAL_FILE_NAME}")
+
+        uploads = st.file_uploader(
+            "Upload Total Distribution .xlsx files",
+            type=["xlsx"],
+            accept_multiple_files=True,
+            key="distribution_uploads",
+        )
+        latest_day_uploads = st.file_uploader(
+            "Upload latest-day UNOPS + WFP files for Fuel Dashboard",
+            type=["xlsx"],
+            accept_multiple_files=True,
+            key="latest_day_uploads",
+        )
+        st.markdown(
+            '<div class="small">The app reads the approval workbook directly from the code folder. The final workbook will include Distribution Summary, Sector Summary, סטטוס לפי אישורים, and the optional Fuel Dashboard and Fuel Overview.</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with right:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("**Pipeline**")
+        st.markdown(
+            """
 1) Combine Total Distribution files  
 2) Run Fuels Cleaner calculations  
 3) Create Distribution Summary  
@@ -4509,175 +3366,67 @@ with right:
 7) Add סטטוס לפי אישורים summary table  
 8) Download final workbook
 """
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
 
-st.markdown("### Fuel Dashboard week dates")
-col1, col2 = st.columns(2)
-with col1:
-    start_date = st.date_input("Week start date")
-with col2:
-    end_date = st.date_input("Week end date")
-
-selected_dates = []
-if start_date and end_date:
-    current = start_date
-    while current <= end_date:
-        selected_dates.append(current)
-        current += timedelta(days=1)
+    st.markdown("### Fuel Dashboard week dates")
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input("Week start date")
+    with col2:
+        end_date = st.date_input("Week end date")
 
 
-def _reset_cached_output():
-    st.session_state.pop("final_bytes", None)
-    st.session_state.pop("final_name", None)
-    st.session_state.pop("debug_logs", None)
-    st.session_state.pop("status_review_summary", None)
-    st.session_state.pop("last_upload_key", None)
+    selected_dates = []
+    if start_date and end_date:
+        selected_dates = [start_date + timedelta(days=n) for n in range((end_date - start_date).days + 1)]
 
+    run_btn = st.button("Run combine + calculations", type="primary", disabled=not uploads)
+    approval_version = None
+    if saved_approval is not None:
+        stat = os.stat(saved_approval.path)
+        approval_version = (stat.st_size, stat.st_mtime_ns)
+    upload_key = (tuple(_upload_identity(u) for u in uploads or []),
+                  tuple(_upload_identity(u) for u in latest_day_uploads or []),
+                  start_date, end_date, approval_version)
+    if upload_key != st.session_state.get("last_upload_key"):
+        _reset_cached_output(st.session_state)
+        st.session_state.last_upload_key = upload_key
 
-if "last_upload_key" not in st.session_state:
-    st.session_state.last_upload_key = None
+    if st.session_state.get("final_bytes"):
+        st.success("Done! Download your final file below.")
+        _show_download(st)
+        return
+    if not run_btn:
+        return
 
-run_btn = st.button("Run combine + calculations", type="primary", disabled=not uploads)
-
-upload_key_parts = []
-if uploads:
-    upload_key_parts.extend([f"dist:{u.name}:{u.size}" for u in uploads])
-if latest_day_uploads:
-    upload_key_parts.extend([f"dash:{u.name}:{u.size}" for u in latest_day_uploads])
-if start_date and end_date:
-    upload_key_parts.append(f"dates:{start_date.isoformat()}:{end_date.isoformat()}")
-if os.path.exists(APPROVAL_STORE_PATH):
-    upload_key_parts.append(f"approval:{os.path.getsize(APPROVAL_STORE_PATH)}:{os.path.getmtime(APPROVAL_STORE_PATH)}")
-
-upload_key = "|".join(upload_key_parts)
-if upload_key and st.session_state.last_upload_key != upload_key:
-    st.session_state.last_upload_key = upload_key
-    st.session_state.pop("final_bytes", None)
-    st.session_state.pop("final_name", None)
-    st.session_state.pop("debug_logs", None)
-    st.session_state.pop("status_review_summary", None)
-
-if "final_bytes" in st.session_state and st.session_state.get("final_bytes"):
-    st.success("Done! Download your final file below.")
-    if st.session_state.get("status_review_summary"):
-        with st.expander("Status review summary"):
-            st.dataframe(pd.DataFrame(st.session_state.status_review_summary), use_container_width=True)
-    if st.session_state.get("debug_logs"):
-        with st.expander("Fuel Dashboard debug logs"):
-            st.text("\n".join(st.session_state.debug_logs))
-    st.download_button(
-        "Download final Excel",
-        data=st.session_state.final_bytes,
-        file_name=st.session_state.get("final_name", "Fuels summary.xlsx"),
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-    st.stop()
-
-if run_btn:
     progress = st.progress(0)
     status = st.empty()
     loader = st.empty()
     loader.info("Processing files…")
-
     try:
-        debug_logs = []
-        approval_source = get_saved_approval_file()
-        if approval_source is None:
-            raise RuntimeError(f"Approval/status workbook was not found next to the app file: {APPROVAL_FILE_NAME}")
-
-        status.info("Step 1/4: Combining Total Distribution files…")
-        progress.progress(5)
-        combined_bytes = build_combined_workbook_bytes(uploads, status=status)
-
-        status.info("Step 2/4: Running Fuels Cleaner calculations…")
-        progress.progress(25)
-        final_bytes = run_calculations_on_combined_bytes(combined_bytes, progress=progress, status=status)
-
-        if latest_day_uploads:
-            if not selected_dates:
-                raise RuntimeError("Please select valid week start and end dates for the Fuel Dashboard.")
-
-            status.info("Step 3/4: Adding Fuel Dashboard sheet…")
-            progress.progress(85)
-
-            final_bytes.seek(0)
-            final_wb = load_workbook(final_bytes)
-            final_wb = add_fuel_dashboard_sheet(
-                final_wb,
-                latest_day_uploads,
-                selected_dates,
-                logs=debug_logs,
-                sheet_name="Fuel Dashboard",
-            )
-            out = BytesIO()
-            final_wb.save(out)
-            final_wb.close()
-            del final_wb
-            out.seek(0)
-            final_bytes = out
-            gc.collect()
+        output, review, logs = generate_report(uploads, latest_day_uploads, selected_dates,
+                                               saved_approval, progress, status)
+        if review.empty:
+            counts = []
         else:
-            status.warning("No latest-day UNOPS/WFP files uploaded, so Fuel Dashboard was not added.")
-
-        status.info("Step 4/4: Adding approval status review and סטטוס לפי אישורים sheet…")
-        progress.progress(94)
-        approval_index, prefixes, _ = build_approval_index(approval_source)
-        final_bytes.seek(0)
-        reviewed_excel, review_df = add_status_to_fuels_summary_workbook(
-            BytesWorkbookFile("generated_fuels_summary.xlsx", final_bytes.getvalue()),
-            approval_index,
-            prefixes,
-            include_match_details=False,
-        )
-        final_bytes = reviewed_excel
-
-        # Release temporary objects from earlier processing stages.
-        try:
-            del combined_bytes
-        except Exception:
-            pass
-
-        gc.collect()
-
-        if review_df is not None and not review_df.empty:
-            status_summary_df = (
-                review_df.groupby(["Detected Org", "Review Status", "Match Type"], dropna=False)
-                .size()
-                .reset_index(name="Count")
-                .sort_values(["Detected Org", "Review Status", "Match Type"])
-            )
-            st.session_state.status_review_summary = status_summary_df.to_dict("records")
-        else:
-            st.session_state.status_review_summary = []
-
-        progress.progress(100)
-        st.session_state.final_bytes = final_bytes.getvalue()
+            columns = ["Detected Org", "Review Status", "Match Type"]
+            counts = review.groupby(columns, dropna=False).size().reset_index(name="Count").to_dict("records")
+        st.session_state.status_review_summary = counts
+        st.session_state.debug_logs = logs
         st.session_state.final_name = "Fuels summary.xlsx"
-        st.session_state.debug_logs = debug_logs
-
+        st.session_state.final_bytes = output.getvalue()
         status.success("Done! Download your final file below.")
-        if st.session_state.get("status_review_summary"):
-            with st.expander("Status review summary"):
-                st.dataframe(pd.DataFrame(st.session_state.status_review_summary), use_container_width=True)
-        if debug_logs:
-            with st.expander("Fuel Dashboard debug logs"):
-                st.text("\n".join(debug_logs))
-        st.download_button(
-            "Download final Excel",
-            data=st.session_state.final_bytes,
-            file_name=st.session_state.final_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-
-    except Exception as e:
+        _show_download(st)
+    except Exception as exc:
         status.empty()
         st.error("Processing failed. The diagnostic below shows the exact file and workbook area that caused the problem.")
-        st.code(str(e), language=None)
+        st.code(str(exc), language=None)
         with st.expander("Technical traceback"):
-            st.exception(e)
-
+            st.exception(exc)
     finally:
         loader.empty()
+
+
+if __name__ == "__main__":
+    main()
